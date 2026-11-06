@@ -1,0 +1,2 @@
+Docs: docs/gxp-design-full.md §2.4 for full syntax + §1.5 for error format.
+File filtering: --glob '*.rs' (repeatable, OR) | --no-gitignore to disable .gitignore respect.

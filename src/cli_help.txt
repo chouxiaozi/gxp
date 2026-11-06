@@ -1,0 +1,46 @@
+Two modes (auto-detected from pattern):
+  BARE  — pattern is ERE, behavior identical to `grep -E 'pat' file`
+  gxp   — DSL: "STRING" literals + field predicates (cost_ms>800) + pipe verbs
+
+Pattern is ERE in BARE mode, DSL expression in gxp mode. Auto-detection:
+pattern containing `|` pipe, `&&`/`||`/`!` operators, or field predicates
+triggers gxp mode; otherwise BARE (ERE compat).
+
+Field predicates: cost_ms>800, _tag in [checkout,billing], cost_ms between 100 and 500, cost_ms exists
+
+Structural queries (L3 ast-grep, 9 langs: ts/rs/py/js/go/tsx/java/c/cpp):
+  ast(LANG, "PATTERN")    — match AST nodes (e.g. ast(rs, "$OBJ.unwrap()") finds all .unwrap() calls)
+  capture(NAME, /REGEX/)   — extract regex capture group into a field (e.g. capture(trace_id, /req-\d+/))
+
+Pipe verbs (chained with `|`):
+  context N                  — context lines (≈ grep -A/-B/-C)
+  files [--invert]           — list matching files only (≈ grep -l/-L)
+  count, group by FIELD     — count hits / count per field value (≈ grep -c)
+  rank top K by FIELD [desc|asc] — partial-sort Top-K
+  sort [by FIELD] [desc|asc]    — full stable sort
+  sample N, sample P%       — representative sampling (fixed seed 0)
+  head N                    — keep first N (limit output)
+  fields F1,F2,...          — project fields from each line
+  stats FIELD               — streaming min/max/avg
+  distinct [by FIELD]       — stable dedup, keep first occurrence
+  percentiles FIELD [p50,p95,p99] — non-streaming nearest-rank
+  trace [LANG]              — multi-line stack trace capture (6 langs + auto)
+  where EXPR                — post-filter upstream hits
+
+Rejected grep short options (use gxp equivalent instead):
+  -A/-B/-C → `context N`                  -l/-L → `files` / `files --invert`
+  -c → `count`                            -e → multiple patterns (adjacency = AND)
+  -i → `(?i:...)` inline regex flag       -v → `!(pred)`
+  -o → default line output                -w → `\b` word boundary in pattern
+  -x → `^...$` full-line anchor            -n → default line numbers
+  -h → `fields <non-filename>`            -r → default recursive (dir arg = recurse)
+  -q → exit code 0/1                      -s → gxp default fail-loud
+
+Examples (see docs/gxp-design-full.md §2.4 for full syntax):
+  gxp 'ERROR' app.log                                                       # BARE ≡ grep -E 'ERROR' app.log
+  gxp '"timeout" && cost_ms>800 | context 3 | fields _ts,cost_ms' app.log # bool + field + pipe
+  gxp 'cost_ms>800 | rank top 10 by cost_ms desc' app.log                   # Top-K ranking
+  gxp '"fn" | head 10' src/                                               # directory recurse
+  gxp 'ERROR | count' app.log                                               # ≡ grep -c ERROR app.log
+  gxp 'panic | trace rust' app.log                                          # multi-line stack trace (scene A)
+  gxp 'ast(rs, "$OBJ.unwrap()")' src/                                       # AST structural search (scene C)
