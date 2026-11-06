@@ -1,0 +1,34 @@
+# gxp .gitattributes — line-ending normalization
+#
+# Scenario adaptation (feedback_gate_config_adapts_to_context.md):
+# - v1 solo (Windows): enforce LF in repo to prevent CRLF drift across machines
+# - PowerShell scripts kept CRLF (PS 5.1 parsing tolerates both, but Windows convention)
+# - retire when: not retireable; this is a permanent guard against OS drift
+
+# Default: text with LF in repo, native checkout (Windows gets CRLF on disk via core.autocrlf=true)
+* text=auto eol=lf
+
+# PowerShell scripts: CRLF in repo (PS 5.1 tolerates LF, but VS Code + PS community convention is CRLF)
+*.ps1 text eol=crlf
+*.psm1 text eol=crlf
+*.psd1 text eol=crlf
+
+# Shell scripts: LF (executed by git for Windows mingw bash, LF is mandatory)
+*.sh text eol=lf
+scripts/hooks/pre-commit text eol=lf
+
+# Rust sources: LF (rustfmt + cargo expect LF)
+*.rs text eol=lf
+*.toml text eol=lf
+
+# Markdown: LF
+*.md text eol=lf
+
+# YAML: LF
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# Binary: explicit
+*.png binary
+*.jpg binary
+*.pdf binary

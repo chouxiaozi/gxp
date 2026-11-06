@@ -1,0 +1,31 @@
+#!/bin/sh
+# gxp pre-commit hook
+#
+# Runs governance 体检 + fmt --check + clippy -D warnings (no tests, commit must stay fast).
+# Use `git commit --no-verify` to bypass.
+#
+# Scenario adaptation (feedback_gate_config_adapts_to_context.md):
+# - v1 solo: governance + fmt + clippy only
+# - next: could add cargo doc --no-deps (slow but commit-time OK if <30s)
+# - retire when: v2 migrates to xtask, replaced by `cargo xtask pre-commit`
+#
+# This hook is executed by git for Windows' mingw bash.
+# It invokes Windows PowerShell 5.1 (powershell.exe, bundled with Win10+).
+# No dependency on pwsh 7+ (which may not be in PATH of git bash).
+
+# Exit on any failure
+set -e
+
+# Resolve repo root (git runs hook from repo root, but be safe)
+REPO_ROOT=$(git rev-parse --show-toplevel)
+
+# Governance 体检（docs/*.md 改动时跑，纯 bash + grep，<5s）
+bash "$REPO_ROOT/scripts/check_governance.sh"
+
+# Invoke check.ps1 with -SkipTest (commit must stay fast)
+# -ExecutionPolicy Bypass: avoid PS execution policy blocking
+# -File: explicit file path (not -Command, avoids quoting issues)
+powershell -ExecutionPolicy Bypass -File "$REPO_ROOT/scripts/check.ps1" -SkipTest
+
+# If we get here, all checks passed
+exit 0

@@ -1,0 +1,8 @@
+# gxp rustfmt 配置（锁版本，防不同机器 rustfmt 版本不一致导致 fmt --check 漂移）
+#
+# 场景适配（feedback_gate_config_adapts_to_context.md）：
+# - v1：锁当前默认行为，避免漂移
+# - v2/团队协作：如需调整（如 max_width），改本文件 + 同 commit 跑 cargo fmt 全量重排
+# - 撤下条件：rust 标准库 edition 升级后默认值变化时重评估
+
+edition = "2021"

@@ -1,0 +1,44 @@
+# === 工具产物 ===
+.codegraph/
+target/
+**/*.rs.bk
+perf.data*
+*.profraw
+*.profdata
+
+# === Cargo 项目级配置（含代理密码，禁止入库）===
+.cargo/
+
+# === IDE / 编辑器 ===
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# === Python 缓存（保留原型 .py 文件本身）===
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# === 测试与基准产物 ===
+fixtures/44mb.log
+fixtures/*.log
+coverage/
+tarpaulin-report.html
+criterion/
+target/criterion/
+
+# === 临时与备份 ===
+*.bak
+*.tmp
+*.log.tmp
+.cac/
+
+# === 分发用二进制（由 scripts/package.sh 生成，不入库）===
+# dist/skill/bin/*.exe 是 cargo build 产物，每次 build diff 巨大且无意义
+# 准备分发时跑 scripts/package.sh 重新生成
+dist/skill/bin/

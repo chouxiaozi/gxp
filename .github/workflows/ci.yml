@@ -1,0 +1,235 @@
+# gxp GitHub Actions CI
+#
+# Scenario adaptation (feedback_gate_config_adapts_to_context.md):
+# - 三平台 matrix（Windows + Linux + macOS），check job 跑全部三平台
+# - v1 hard gates: doc / all-features / cargo-deny (block on failure)
+# - v1 info gates (non-blocking): msrv / dry (jscpd) / coverage (llvm-cov) / mutation (cargo-mutants)
+# - next (v2): tighten info→blocking as project stabilizes
+# - retire when: not retireable; this is the final safety net (cannot --no-verify bypass)
+#
+# Job map:
+#   check          fmt + clippy + test (all --all-features)  (blocking, PR + push, 3-platform matrix)
+#   doc            cargo doc --no-deps          (blocking, PR + push, Linux-only)
+#   all-features   cargo build --all-features  (blocking, PR + push, Linux-only)
+#   deny           cargo-deny advisories/bans/licenses  (blocking, PR + push)
+#   msrv           cargo check on rust-version (non-blocking, PR + push, info-only until stabilized)
+#   dry            jscpd copy-paste detector   (non-blocking, PR + push)
+#   coverage       cargo-llvm-cov              (non-blocking, Windows-only, PR + push)
+#   mutation       cargo-mutants               (non-blocking, main push only, 30min timeout)
+#   udeps          cargo-udeps (nightly)        (non-blocking, PR + push, detects unused deps in Cargo.toml)
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # === Blocking gates ===
+
+  check:
+    name: fmt + clippy + test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          # Windows 用 GNU target 绕开 VS Build Tools（AGENTS.md §4）
+          targets: ${{ matrix.os == 'windows-latest' && 'x86_64-pc-windows-gnu' || '' }}
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: check no inline e2e tests in src/
+        run: bash scripts/check_no_e2e_inline.sh
+
+      - name: cargo clippy -D warnings
+        run: cargo clippy --all-features --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --all-features --no-fail-fast
+
+  doc:
+    name: cargo doc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo doc
+        run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  governance:
+    name: docs governance 体检
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run governance 体检
+        run: bash scripts/check_governance.sh
+
+  all-features:
+    name: cargo build --all-features
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo build --all-features
+        run: cargo build --all-features
+
+  deny:
+    name: cargo-deny check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: cargo deny check
+        run: cargo deny check advisories bans licenses
+
+  # === Non-blocking info gates ===
+  # These run for visibility but use continue-on-error so PRs aren't blocked.
+  # Tighten to blocking once the project has stabilized (see feedback_gate_config_adapts_to_context.md).
+
+  msrv:
+    name: MSRV (rust-version = 1.75)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.75 (declared MSRV in Cargo.toml)
+        uses: dtolnay/rust-toolchain@1.75.0
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo check --all-features on MSRV
+        # v1: info-only. Verifies Cargo.toml's rust-version=1.75 compiles with --all-features.
+        # Tighten to blocking after remote CI has 3 consecutive green runs (remove continue-on-error).
+        run: cargo check --all-features --locked
+
+  dry:
+    name: DRY (jscpd)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install jscpd
+        run: sudo npm install -g jscpd
+
+      - name: Run jscpd
+        # L1/L2/DSL/pipeline 已落地，收紧到 threshold 5
+        run: jscpd --format "rust" --reporter console --threshold 5 --exitCode 1 src/ tests/
+
+  coverage:
+    name: coverage (cargo-llvm-cov)
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (GNU, stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+          targets: x86_64-pc-windows-gnu
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo llvm-cov
+        # v1: info-only. 500+ tests across L1/L2/L3/DSL/pipeline/dir.
+        # Tighten with --fail-under-lines 80 once CI baseline stabilizes (AGENTS.md §6.1).
+        run: cargo llvm-cov --all-features --text
+
+  mutation:
+    name: mutation (cargo-mutants)
+    # Only on main push; mutation is slow (30min) and requires high coverage first
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-mutants
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo mutants
+        # v1: info-only. 574+ tests across L1/L2/L3/DSL/pipeline/dir.
+        # Tighten / move to PR once coverage > 70% (AGENTS.md §6.1).
+        run: cargo mutants --no-copy-target --timeout 300
+
+  udeps:
+    name: unused deps (cargo-udeps)
+    # Detects Cargo.toml deps declared but not `use`d in code (dependency drift).
+    # Needs nightly toolchain. Not in pre-commit (nightly too heavy for local dev).
+    # v1: info-only. Tighten to blocking after remote CI has 3 green runs (remove continue-on-error).
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (nightly)
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-udeps
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-udeps
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo udeps
+        run: cargo +nightly udeps --all-features

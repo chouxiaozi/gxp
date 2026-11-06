@@ -1,0 +1,36 @@
+# gxp cargo-deny configuration
+#
+# Scenario adaptation (feedback_gate_config_adapts_to_context.md):
+# - v1 solo: permissive (warn-level for most, deny only for incompatible licenses)
+# - next (team): tighten bans (e.g., disallow duplicate deps with same name)
+# - next (CVE): promote advisories from warn to deny after first audit triage
+
+[licenses]
+# gxp output license: MIT OR Apache-2.0 (AGENTS.md §7.3)
+# Allow only OSI-approved licenses compatible with MIT OR Apache-2.0
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",
+]
+# Deny anything not in allow list (fail-loud, AGENTS.md §3.2)
+confidence-threshold = 0.8
+
+[bans]
+# v1: warn on duplicates (don't fail CI for benign cases)
+multiple-versions = "warn"
+wildcards = "warn"
+
+[advisories]
+# v1: warn on advisories (don't fail CI; triage later)
+# Tighten to "deny" once a triage process is in place
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"

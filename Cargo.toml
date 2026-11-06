@@ -1,0 +1,152 @@
+[package]
+name = "gxp"
+version = "0.45.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "grep-aligned query language for LLM agents (not a strict superset)"
+rust-version = "1.75"
+
+[lib]
+name = "gxp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gxp"
+path = "src/main.rs"
+
+[dependencies]
+# L1 引擎
+regex = "1.10"
+regex-syntax = "0.8"
+aho-corasick = "1.0"
+
+# L2 字段抽取
+memchr = "2.7"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+speedate = "0.16"
+
+# 目录层
+ignore = "0.4"
+blake3 = "1.4"
+# 跨文件并行扫描（PreparedScan/CompiledL1 均已验证 Send+Sync）
+rayon = "1.10"
+# glob 文件名过滤（globset，DFA 高性能，ripgrep 同源）
+globset = "0.4"
+# memmap2 从生产依赖降为 bench-only（D10 改判：统一 read_to_end）
+# memmap2 仅供 benches/diag_mmap.rs 对照基准使用，见 [dev-dependencies]
+
+# CLI
+clap = { version = "4.5", features = ["derive", "cargo"] }
+clap_complete = "4.5"
+nom = "7.1"
+thiserror = "1.0"
+
+# 可选：ripgrep 搜索循环壳（v1 不默认启用）
+grep-searcher = { version = "0.1", optional = true }
+grep-regex = { version = "0.1", optional = true }
+grep-matcher = { version = "0.1", optional = true }
+
+# 可选：SIMD JSON（v1 不默认启用；统一 read_to_end 后行已在 Vec<u8>，可原地 mutation）
+simd-json = { version = "0.13", optional = true }
+
+# L3 结构层（v1 不默认启用，ast-grep 编译重）
+# 注意：ast-grep-core v0.45 内部依赖 tree-sitter 0.26，故此处不直接声明 tree-sitter
+# （否则会触发 cargo links = "tree-sitter" 冲突）
+ast-grep-core = { version = "0.45", optional = true }
+ast-grep-language = { version = "0.45", optional = true, features = ["builtin-parser"] }
+
+[dev-dependencies]
+proptest = "1.4"
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3.10"
+memmap2 = "0.9"          # 降为 dev-dependency，仅 diag_mmap.rs 对照基准使用
+
+[features]
+default = []
+ripgrep-engine = ["dep:grep-searcher", "dep:grep-regex", "dep:grep-matcher"]
+simd-json = ["dep:simd-json"]
+# l3-structural 不直接依赖 tree-sitter（ast-grep-core 自带 0.26），避免 links 冲突
+l3-structural = ["dep:ast-grep-core", "dep:ast-grep-language"]
+
+[[bench]]
+name = "l1_scan"
+harness = false
+path = "benches/l1_scan.rs"
+
+[[bench]]
+name = "l2_extract"
+harness = false
+path = "benches/l2_extract.rs"
+
+[[bench]]
+name = "full_pipeline"
+harness = false
+path = "benches/full_pipeline.rs"
+
+[[bench]]
+name = "sample"
+harness = false
+path = "benches/sample.rs"
+
+[[bench]]
+name = "sort"
+harness = false
+path = "benches/sort.rs"
+
+[[bench]]
+name = "scale_dir"
+harness = false
+path = "benches/scale_dir.rs"
+
+[[bench]]
+name = "diag_pipeline"
+harness = false
+path = "benches/diag_pipeline.rs"
+
+[[bench]]
+name = "diag_stages"
+harness = false
+path = "benches/diag_stages.rs"
+
+[[bench]]
+name = "diag_breakdown"
+harness = false
+path = "benches/diag_breakdown.rs"
+
+[[bench]]
+name = "diag_writeonly"
+harness = false
+path = "benches/diag_writeonly.rs"
+
+[[bench]]
+name = "diag_mmap"
+harness = false
+path = "benches/diag_mmap.rs"
+
+[[bench]]
+name = "diag_v7_streaming"
+harness = false
+path = "benches/diag_v7_streaming.rs"
+
+[[bench]]
+name = "l3_scan"
+harness = false
+path = "benches/l3_scan.rs"
+required-features = ["l3-structural"]
+
+[[bench]]
+name = "verify_overhead"
+harness = false
+path = "benches/verify_overhead.rs"
+
+[[bench]]
+name = "diag_batch_projection"
+harness = false
+path = "benches/diag_batch_projection.rs"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
