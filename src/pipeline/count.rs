@@ -146,7 +146,7 @@ mod tests {
             .enumerate()
             .map(|(i, (s, mb))| {
                 let mut m = MatchedLine::new(i + 1, s.as_bytes());
-                m.match_bytes = mb.map(|b| b.to_vec());
+                m.match_bytes = mb.map(std::sync::Arc::from);
                 m
             })
             .collect()
@@ -157,7 +157,7 @@ mod tests {
             .enumerate()
             .map(|(i, (s, p))| {
                 let mut m = MatchedLine::new(i + 1, s.as_bytes());
-                m.path = Some(p.to_string());
+                m.path = Some(std::sync::Arc::from(*p));
                 m
             })
             .collect()

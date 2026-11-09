@@ -4,7 +4,7 @@
 > **更新规则**：每次功能落地或变更后更新对应行；更新时修改底部"最后更新"时间。
 > **与路线图的关系**：本文档是横向能力快照；`docs/changelog.md` 是纵向版本演进。两者互补。
 
-**最后更新**: 见 `docs/changelog.md` 最新版本（v0.45 — L3 ast() 扩展名过滤优化，--no-gitignore 大目录提速 40-53%，详见 changelog v0.45 行）
+**最后更新**: 见 `docs/changelog.md` 最新版本（v0.47 — B14 无括号混合 `&&`/`||` 与 Regex 组合的 L1 下推健全性修复，详见 changelog v0.47 行）
 **测试基线**: 见 §4 代码规模表
 
 ---
@@ -19,11 +19,15 @@
 | | ast() 豁免（L1 不下推，L3 精判） | ✅ | `compiler.rs::collect_prim_literals` | cli_e2e ast 测试 |
 | | 伪字段豁免（`_ts`/`_tag` 不参与前缀粗筛） | ✅ | `compiler.rs::is_pseudo_field` | lib 内联 |
 | | 纯字面量组跳过 regex verify（aho-corasick 命中即等价 regex 命中） | ✅ | `compiler.rs::LiteralGroup::is_pure_literal` | lib 内联 |
+| | Or 组完整性（B14）：任一分支不推进字面量（And/Not/Regex/Pred/Ast/Capture）→ 整组放弃，L2 全树精判；scan 捷径以 `l1_exact` 为门槛 | ✅ v0.47 | `compiler.rs::collect_or_literals` + `detect.rs::l1_exact` | compiler 4 + detect 4 单元 + cli_pipeline 7 e2e |
+| | Or 子树前缀豁免（B15）：Or 分支内字段谓词不参与前缀粗筛（AND 语义的前缀会误杀另一分支候选） | ✅ v0.48 | `compiler.rs::collect_field_predicates_inner` | compiler 3 单元 + cli_string_eq 4 e2e |
 | **L2 精判** | 4 格式：logfmt k=v/k:v / JSON line / [tag] / ISO 8601 | ✅ | `src/l2/{extract,format}.rs` | `tests/l2_extract.rs` |
 | | JSON line 仅顶层字段过滤；嵌套路径 / 多行合并 / Array 展开委托 `jq -c` + `gron` 组合（B10/B11 后边界） | ✅ | `src/l2/extract.rs::find_value`（含 JSON 兜底） + `src/l2/format.rs::detect_format`（B11 trim 空白） | `tests/l2_extract.rs` |
 | | 11 维数值契约（D5） | ✅ | `src/l2/numeric.rs` | `tests/numeric_eval_exhaustive.rs` (0..60000 × 6 区间) |
 | | `Compare`（6 op: > < >= <= == !=） | ✅ | `src/mode/detect.rs::eval_prepared` | cli_e2e |
 | | `In`（集合成员判定） | ✅ | 同上 | cli_e2e |
+| | 字符串等值 `NAME="STRING"`（`=`/`==` 带引号 RHS 解析期脱糖单元素 In；`!=`/`>` 带引号 fail-loud + hint；单 `=` 非数值 RHS 回退 ERE 字面量） | ✅ v0.48 | `dsl/parser.rs::pred_compare`（脱糖）+ `mode/gxp.rs::enrich_string_eq_hint`（hint）+ `detect.rs::has_field_predicate`（前瞻） | cli_string_eq 20 e2e |
+| | Literal 重校验豁免（v0.49 Opt A）：单元素纯字面量必选组成员（`verified_literals`）L2 免 `regex.is_match` 重跑；Or 组（≥2 元素）/Paren(And)（组放弃）/Not 侧不豁免 | ✅ v0.49 | `compiler.rs::verified_literals` + `prepared.rs::l1_verified` + `eval.rs` 双镜像豁免分支 | compiler 6 单元 + cli_l1_verified 6 e2e（独立期望集） |
 | | `Between`（闭区间） | ✅ | 同上 | cli_e2e |
 | | `Exists`（字段存在性） | ✅ | 同上 | cli_e2e |
 | | `Not`（三态取反：True→False / False→True / NotNumeric→True） | ✅ | 同上 | cli_e2e |
@@ -52,6 +56,7 @@
 | **L4 管道** | `where`（二次过滤） | ✅ | `src/pipeline/mod.rs::apply_where` | cli_e2e |
 | | `context N`（等价 grep -A/-B/-C） | ✅ | `src/pipeline/context.rs` | cli_e2e |
 | | `count` / `count by FIELD`（等价 grep -c） | ✅ | `src/pipeline/count.rs` | cli_e2e |
+| | `group by FIELD`（按字段值分组计数，输出 `value: N`；独立动词） | ✅ | `src/pipeline/count.rs::apply_count_group_by` | lib 内联 + cli_e2e |
 | | `rank top K by FIELD [desc\|asc]`（partial-sort） | ✅ | `src/pipeline/rank.rs` | cli_e2e |
 | | `sort [by FIELD] [desc\|asc]`（全量稳定排序） | ✅ | `src/pipeline/sort.rs` | cli_e2e 19 项 |
 | | `sample N` / `sample P%`（固定种子 0 抽样） | ✅ | `src/pipeline/sample.rs` | cli_e2e |
@@ -61,7 +66,7 @@
 | | `stats FIELD`（流式聚合 min/max/avg） | ✅ | `src/pipeline/stats.rs` | cli_e2e |
 | | `distinct [by FIELD]`（稳定去重，保留首次出现） | ✅ v0.35 | `src/pipeline/distinct.rs` | cli_e2e |
 | | `percentiles FIELD [p50,p95,p99]`（非流式 nearest-rank） | ✅ v0.37 | `src/pipeline/percentiles.rs` | cli_e2e |
-| | `trace [LANG]`（多行 stack trace；6 语言 + 自动检测） | ✅ v0.39 | `src/pipeline/trace.rs` | cli_trace 17 项 |
+| | `trace [LANG]`（多行 stack trace；6 语言 + 自动检测；rust 新旧 panic 格式 + 帧间 at 行 v0.46） | ✅ v0.39 | `src/pipeline/trace.rs` | cli_trace 19 项 |
 | | 管道链式组合（如 `context 3 | fields _ts,cost_ms`） | ✅ | `pipeline/mod.rs::execute_stages` | cli_e2e |
 | | 目录多文件聚合（全局 rank 归并 + context 不跨文件） | ✅ | `pipeline/mod.rs::execute_stages_directory` | cli_e2e |
 | **目录层** | `PathPlan::walk`（手写栈式 readdir） | ✅ | `src/dir/plan.rs` | `tests/dir_pruning.rs` |
@@ -104,6 +109,8 @@
 | L3 ast() 多语句 pattern 触发 ast-grep 上游限制 | ⚠️ 已记录 | `#[test] fn $NAME()` 触发 "Multiple AST nodes detected"，非 gxp bug；gxp 错误信息清晰暴露 |
 | L3 ast() 大目录验证 0 FAIL（v0.44，2026-11-01） | ✅ | web-app 3378 文件（2329 .ts + 46 .js）× 3 ast pattern × --verify = 0 FAIL，~1.1-1.4s（详见 perf-baseline §1.3） |
 | L3 ast() --no-gitignore 大目录验证 0 FAIL（v0.45，2026-11-01） | ✅ | web-app 72K 文件 × 3 ast pattern × --verify = 0 FAIL，扩展名过滤后 40-53% 提速（详见 perf-baseline §1.3） |
+| 911MB 合成 JSONL 双法 GT 对账（v0.47，2026-11-09） | ✅ | 12 项基准答案 gxp × grep/构造模型全部精确闭合（含边界含端点 + 非法时间戳拒绝语义，详见 agent-ab-experiment.md §3） |
+| agent A/B 实验 16/16 全对（v0.47，2026-11-09） | ✅ | 8 场景 × 2 臂独立 agent，答案对照冻结 GT 全对；结论"混合→按场景收敛"，详见 `docs/agent-ab-experiment.md` |
 
 ---
 
@@ -122,6 +129,6 @@
 | 源码总行数 | ~17,129 行 |
 | 集成测试文件 | 25 个 |
 | 基准 bench 文件 | 15 个 |
-| 默认 feature 测试 | 964 全绿（v0.45 实测 2026-11-02，governance §4.1.8 自动对账） |
-| l3-structural feature 测试 | 1059 全绿（v0.45 实测 2026-11-02，governance §4.1.8 自动对账） |
+| 默认 feature 测试 | 1030 全绿（v0.49 实测 2026-11-09，governance §4.1.8 自动对账） |
+| l3-structural feature 测试 | 1125 全绿（v0.49 实测 2026-11-09，governance §4.1.8 自动对账） |
 | 生产依赖 crate | 14 个（+ 4 optional/dev） |

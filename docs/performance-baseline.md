@@ -3,9 +3,9 @@
 > **用途**：所有性能数据的单一参考源。版本迭代后更新此文件。
 > **更新规则**：跑完 bench 后立即更新；版本号 + 日期 + 实测条件必须齐全。
 
-**最后更新**: v0.45（2026-11-02）— 性能复测（三轮 diag bench）+ L3 ast() 扩展名过滤优化 + web-app 交叉验证，详见 §1.1-1.3
-**实测日期**: 2026-10-26（v0.32 性能基线实测日 + v0.41 复测）+ 2026-10-27（12GB 大数据多轮实测）+ 2026-11-01（v0.45 扩展名过滤实测）+ 2026-11-02（v0.45 三轮 diag bench 复测）
-**实测环境**: Windows 11 Pro 10.0.26200 / x86_64-pc-windows-gnu / rustc 1.99.1 / GCC 15.2.0 / i7-14700
+**最后更新**: v0.49（2026-11-09）— T1a 优化落地：L2 Literal 重校验豁免 + collect 零分配化，全管道 125.30→106.74ms（**−14.8%**，diag median of 3），详见 §1.2
+**实测日期**: 2026-10-26（v0.32 性能基线实测日 + v0.41 复测）+ 2026-10-27（12GB 大数据多轮实测）+ 2026-11-01（v0.45 扩展名过滤实测）+ 2026-11-02（v0.45 三轮 diag bench 复测）+ 2026-11-09（v0.47 复测，起测量机为本机 i7-10700；v0.48 T1a 基线锚定；v0.49 T1a 优化实测）
+**实测环境**: v0.32-v0.45 数据实测于 **i7-14700 / Win11 26200**（旧机）；v0.47 复测起实测于 **i7-10700 / Win11 26100**（本机，v0.45 后仓库迁移）。两机同为 x86_64-pc-windows-gnu / rustc 1.99.1 / GCC 15.2.0。**跨机绝对值不可比**（同版本比值实测 1.52-1.85×，详见 §1.1 机器变更说明）
 **基准场景**: 44MB 日志文件 / 1,060,000 行 / 31931 候选行 / Top20 投影
 **目录基准**: web-app 70648 文件（rayon 并行实测）
 **大数据基准**: 12GB 合成 transcript / 11603 文件 / 60 子目录（详见 §3.1）
@@ -14,26 +14,115 @@
 
 > **v0.45 三轮复测结果（2026-11-02）**：diag_pipeline/diag_breakdown/diag_stages 各 3 轮，run_with_writer median 80.77ms，与 v0.41 的 80.30ms 一致（+0.6% 噪声范围内）。热路径零 commit（git log 确认 v0.41→v0.45 期间 `src/l1/`/`src/l2/`/`src/mode/`/`src/io/file.rs`/`src/plan.rs` 无改动）。execute_stages v0.45 median 14.12ms vs v0.41 的 8.74ms，但 diag_stages 独立测 execute_stages 是 15.76ms（与 v0.32 的 9.42ms 也有差异）——diag_pipeline 和 diag_stages 都是独立进程单次 min，execute_stages 的波动来自进程启动/cache 状态差异，非代码退化。详见 §1.1 v0.45 列 + §1.6 归因分析。
 
+> **v0.47 复测结果（2026-11-09，测量机变更）**：B14（l1_exact 捷径门槛 + Or 组完整性）**零回归**——判定方法是同机 A/B：v0.45 源码 worktree 在本机同工具链同 fixture 编译实测 diag run_with_writer 125.12ms，与 v0.47 的 128.09ms（3 轮 median）差 +2.4%（噪声级，各阶段差异 ≤4.5%）。**同时发现 v0.32-v0.45 全部数据来自旧机 i7-14700**（本机 CPU i7-10700 + OS build 26100 与文档头部 i7-14700 + 26200 双重不符，且仓库在 v0.45 squash 重建时迁移）：同版本跨机比值 1.52-1.85×（全管道 128.09/80.77 = 1.59×，符合两代 CPU 单核差距）。**v0.47 列起为本机 i7-10700 新锚点，与历史列不可直接比值**；80ms 目标（AGENTS.md §7.1）锚定于旧机——已决策重锚定为本机基线锚点 + 回归性门禁（2026-11-09 用户确认，见 §1.1 机器变更说明）。另：criterion `gnu_grep_pipe` 对照在本机失效（msys 子进程 spawn ~400-500ms/进程，5 进程管道 1.4-2.6s，测的是进程启动开销非吞吐——错误路径实证：文件不存在时管道耗时相同），后续 grep 对照改用直接进程调用（§1.3.2 方法）。
+
 ---
 
 ## 1. 核心指标总览
 
-### 1.1 全管道性能（目标 <80ms）
+### 1.1 全管道性能（基线锚点 106.74ms = v0.49 本机实测；门禁见 AGENTS.md §7.1）
 
-| 指标 | Rust 目标 | v0.32 实测 | v0.41 复测 | v0.45 复测 | 状态 |
-|---|---|---|---|---|---|
-| 全管道 + Top20 + 投影 | 80ms | 66-76ms | 80.30ms（噪声边缘） | 80.77ms（噪声边缘） | ✅ 达标（边缘） |
-| L1 两遍链 | 30ms | 18.66ms | 17.28ms | 18.10ms | ✅ 达标 |
-| L2 字段抽取（31931 候选行） | 20ms | ~12ms | 5.42ms | 5.42ms | ✅ 达标 |
-| DirIndex lax 二次（Linux） | 0.15ms | 未验证（Windows 物理 ~2.8ms） | 未验证 | 未验证 | ⚠️ Windows 物理不可达，Linux 待 CI 接入 |
+| 指标 | 基线锚点（本机，AGENTS.md §7.1） | v0.32 实测 | v0.41 复测 | v0.45 复测 | v0.47 复测（本机 i7-10700） | v0.49 T1a 优化（本机） | 状态 |
+|---|---|---|---|---|---|---|---|
+| 全管道 + Top20 + 投影 | 106.74ms | 66-76ms | 80.30ms（噪声边缘） | 80.77ms（噪声边缘） | 128.59ms（criterion）/ 128.09ms（diag median） | **106.74ms（diag median，−14.8%）** | ✅ 旧机达标（边缘）；本机锚点 = v0.49 实测，median 劣化 >10% 需归因 |
+| L1 两遍链 | 33.51ms | 18.66ms | 17.28ms | 18.10ms | 32.34ms（criterion）/ 33.44ms（diag） | 33.51ms（diag，不变） | ✅ 旧机达标；本机锚点 = v0.49 实测 |
+| L2 字段抽取（31931 候选行） | 8.21ms | ~12ms | 5.42ms | 5.42ms | 8.21ms（criterion l2_extract） | 未复测（v0.47 8.21 参照） | ✅ 旧机达标；本机锚点 = v0.47 实测（v0.49 未复测） |
+| DirIndex lax 二次（Linux） | 0.15ms | 未验证（Windows 物理 ~2.8ms） | 未验证 | 未验证 | 未复测 | ⚠️ Windows 物理不可达，Linux 待 CI 接入 |
 
-v0.45 vs `gnu_grep -E | head -20` ~148ms（criterion 实测），gxp ~1.8× 快。v0.41 时 gxp 1.7× 快（gnu_grep 140ms），比值波动来自系统 cache 状态。
+> **机器变更说明（v0.47 复测起）**：v0.32-v0.45 列实测于旧机 i7-14700，v0.47 列实测于本机 i7-10700（仓库 v0.45 后迁移），**跨机比值 1.52-1.85×，列间不可直接比值**。B14 零回归由同机 A/B 判定（v0.45 源码本机实测 125.12ms vs v0.47 128.09ms，+2.4% 噪声级，详见顶部 v0.47 复测说明）。80ms/30ms/20ms 目标锚定于旧机——**已决策（2026-11-09，用户确认）：§7.1 重锚定为本机基线锚点 + 回归性门禁（同机 A/B，median 劣化 >10% 需归因），旧机目标降为历史参考**，本表首列即新锚点。
+
+v0.45 vs `gnu_grep -E | head -20` ~148ms（criterion 实测），gxp ~1.8× 快。v0.41 时 gxp 1.7× 快（gnu_grep 140ms），比值波动来自系统 cache 状态。**（旧机数据）本机 i7-10700 上该 criterion `gnu_grep_pipe` 对照失效**：msys 子进程 spawn ~400-500ms/进程（5 进程管道 1.4-2.6s），测的是进程启动开销非 grep 吞吐；本机 grep 对照改用直接进程调用（见 §1.3.2 ripgrep 对照小节方法）。
 
 > **v0.41 复测说明（2026-10-26）**：v0.32→v0.41 期间落地 v0.33 sample/v0.34 sort/v0.35 distinct/v0.37 percentiles/v0.39 trace，性能未退化反而略改善。新动词都是 L4 pipeline 阶段，不进入 L1+L2 热路径。L2 抽取 12ms→5.42ms 改善 56%。**归因是系统 cache 状态差异，非代码优化**：`git log -- src/l1/ src/l2/ src/mode/ src/io/file.rs src/plan.rs` 显示 v0.32→v0.41 期间热路径零 commit；v0.41 实测第二次跑（warm cache）进一步降到 74.64ms，证明改善来自 page cache 预热状态。两次实测用的是同一份确定性生成的 fixtures/44mb.log，输入数据完全相同。
 
 ### 1.2 分阶段拆解（diag_pipeline + diag_breakdown + diag_stages）
 
 ```
+v0.49 T1a 优化实测（2026-11-09，本机 i7-10700，diag_pipeline median of 3 rounds：
+  110.70/106.74/106.53 → median 106.74ms，vs v0.48 基线 125.30 **−18.56ms / −14.8%）：
+  read_for_scan:              13.37ms   （不变，I/O）
+  L1 scan_lines_cb (count):   33.51ms   （不变——L1 编译器只增 verified_literals 产出）
+  L1+L2 eval (no collect):    47.68ms   （简化 bench 阶段，不含豁免收益）
+  L1+L2+collect:              57.30ms   （同上）
+  execute_stages:             18.16ms   （25.17→18.16，−7.0ms：MatchedLine 缩水红利
+                                          ——match_bytes/path 两字段 3-word→2-word，
+                                          clone 与排序 cache 局部性受益）
+  ─────────────────────────────────────
+  run_with_writer 完整:       106.74ms  （生产路径收益 ~16ms 集中在 collect：
+                                          Literal regex 重校验豁免 + match_bytes/path
+                                          零分配；diag_stages 完整 24.29→17.17 交叉一致）
+  未归因差值:                  ~17.9ms（106.74 − 各阶段累计 88.8；原 29.94——生产冗余
+                              ~16ms 已消除，余下为相位隔离测量理想化 + PreparedScan::build
+                              + 分发开销，samply 不可用（v0.13.1 本机编译失败），已归因——
+                              见下方「残差归因」块）
+
+  优化明细（Rust 方案 §7.9，归因数据见 v0.48 块下方归因表）：
+    Opt A  Literal 重校验豁免     +5.8ms（verified_literals 构造性论证）
+    Opt B  match_bytes Arc+快速路径 ~3.6ms（单元素组免 aho 二查）
+    Opt C  path Arc<str>          ~6.5ms（每行 String clone → refcount）
+    计划 ~15.9ms；实测全管道 −18.56ms（含 stages 红利 ~7ms，结构缩水意外收益）
+
+  残差归因（2026-11-09 晚，v0.49 后，diag_pipeline 新增 C1/C2/C3 判别检查点，
+  3 轮 median；本轮全管道 108.55ms vs 锚点 106.74 +1.7% 噪声级，R1 136.68
+  首轮离群（新编 exe Defender 税 + 首触）弃用）：
+    C1 parse_query+compile:                     0.04ms（parse/compile 与残差无关，排除）
+    C2 端到端复刻链（public API 按生产顺序串联，fresh read）: 104.44ms
+    C3 同链 warm buffer（无 read）:              92.70ms
+    C2 − C3 = 11.74 ≈ read 独立值 14.48 → fresh buffer 无额外冷页/TLB 税
+    本轮残差 = 108.55 − 阶段累计 94.84（read 14.48 + L1 35.04 + L2 inc 13.88
+    + collect inc 11.53 + stages 19.91）= 13.71ms（v0.49 轮 17.9，会话间噪声 ±4ms）
+
+  三桶拆解（合计 ~14.9 ≈ 残差 13.71，块间噪声 ±2-3ms 内闭合）：
+    ① 复刻口径差 ~6.0ms：生产形态 collect 66.49 vs 简化 collect 60.45——
+       match_bytes/path 逐行填充（103607 行 Option 写入 + 结构脏化）；
+       `_match`/`_file` 伪字段语义必需（场景 A/D 一等公民），非可削减冗余
+    ② 链内相位交错 ~4.8ms：C2 104.44 − 各段独立 min 之和 99.68（read 14.48
+       + C1 0.04 + 生产 collect 66.49 + stages 生产形态 18.67）——单遍串联
+       vs 分段热循环的 TLB/cache/分配器交错，端到端固有属性
+    ③ 生产专属 ~4.1ms：run_with_writer 108.55 − C2 104.44——PreparedScan::build
+       （<0.1ms）+ eval_prepared 机制 vs 简化 l2_match（含 CaptureMap::new ×
+       141367 L1 命中行）+ dispatch（reject/positional/metadata，<0.5ms）
+
+  结论：残差无单一大头（三桶各 4-6ms）。triage：① 语义必需、② 端到端固有，
+  均非优化靶；③ 内 CaptureMap 空表共享（no-capture 查询免 141k 次构造）预估
+  <2ms，需动 with_captures 边界，收益/风险比不足，暂不做（Rust 方案 §7.9 补记）。
+  stages 内 rank key extraction 8.24ms（diag_stages）仍是最大单一可优化靶（可选后续）。
+
+v0.48 T1a 基线锚定（2026-11-09，本机 i7-10700，diag_pipeline median of 3 rounds，3 轮离散 <2%）：
+  read_for_scan:              12.57ms   fs::read 44MB → Vec<u8>（3 轮 12.42/12.57/13.49）
+  L1 scan_lines_cb (count):   33.72ms   memchr + aho-corasick（命中 141367 行）
+  L1+L2 eval (no collect):    47.28ms   + find_value + eval_numeric（L2 命中 103607）
+  L1+L2+collect:              57.62ms   + MatchedLine Arc<[u8]> clone（7019876 字节）
+  execute_stages:             25.17ms   rank partial-sort + fields 投影
+  ─────────────────────────────────────
+  run_with_writer 完整:       125.30ms  （3 轮：125.18/125.30/127.75）
+  各阶段增量累计:              95.36ms   （L2 eval 增量 13.56 + collect 增量 10.34）
+  未归因差值:                  29.94ms（~24%）— T1a 第一靶子，与 v0.47 的 31.46ms 同量级
+
+  vs v0.47（同机）：全管道 −2.2%、L1 +0.8%、execute_stages −0.3%，噪声级零回归
+  （read −7.8% 属 I/O cache 噪声）。diag 主查询为 And + In 形态，不经过 v0.48
+  改动路径（字符串等值脱糖 / B15 Or 前缀豁免），零回归符合预期。
+
+  T1a 归因（diag_pipeline 复刻检查点，v0.48 形态，2026-11-09）：
+    L1 + Literal regex.is_match:     39.39ms（vs L1 33.59 → 重校验 +5.80ms/141367 行）
+    生产形态 collect（v0.48 复刻）:   80.12ms（vs 简化 57.68 → 总增量 +22.44ms）
+      其中 path 填充 ~6.5ms / match_bytes（aho 二查+Vec 分配）~3.6ms
+      （A/B 变体同轮相对拆分，该轮受后台任务 CPU 竞争，绝对值偏高仅取差值）
+    残差 ~11ms：相位隔离测量理想化（standalone min 热循环 vs 单次冷路径）
+
+v0.47 复测（2026-11-09，本机 i7-10700，diag_pipeline median of 3 rounds）：
+  read_for_scan:              13.64ms   fs::read 44MB → Vec<u8>
+  L1 scan_lines_cb (count):   33.44ms   memchr + aho-corasick（命中 141367 行）
+  L1+L2 eval (no collect):    47.85ms   + find_value + eval_numeric（L2 命中 103607）
+  L1+L2+collect:              57.74ms   + MatchedLine Arc<[u8]> clone（7MB 总字节）
+  execute_stages:             25.25ms   rank partial-sort + fields 投影
+  ─────────────────────────────────────
+  run_with_writer 完整:       128.09ms  （3 轮：128.09/129.82/126.68，离散 <2%）
+
+  同机 A/B 对照（v0.45 源码 worktree，同工具链同 fixture，单次）：
+  run_with_writer: 125.12ms / L1 scan: 33.28 / L1+L2: 47.46 / collect: 56.80 / execute_stages: 24.16
+  → 与 v0.47 各阶段差异 ≤4.5%（噪声级），B13/B14 零回归
+
 v0.45 三轮复测（2026-11-02，diag_pipeline median of 3 rounds）：
   read_for_scan:              11.69ms   fs::read 44MB → Vec<u8>
   L1 scan_lines_cb (count):   18.10ms   memchr + aho-corasick（命中 141367 行）
@@ -90,6 +179,33 @@ diag_stages (median, v0.45 三轮复测 2026-11-02):
   apply_rank:                   8.68ms
   rank key extraction:         5.53ms
   sort_by (precomputed):       2.04ms
+
+diag_breakdown (median, v0.48 T1a 锚定 2026-11-09，本机 i7-10700，3 轮):
+  scan + L2 + collect:         59.75ms
+  execute_stages:              27.27ms
+  read_for_scan:               12.56ms
+  parse + compile:              0.06ms
+  run_with_writer 完整:       124.89ms  （与 diag_pipeline 125.30 差 0.3%，交叉一致）
+
+diag_stages (median, v0.48 T1a 锚定 2026-11-09，本机 i7-10700 首次拆解，3 轮):
+  execute_stages 完整:         24.29ms
+  apply_rank:                  14.26ms
+  rank key extraction:         8.72ms   (find_value + parse_numeric，占 apply_rank 61%)
+  sort_by (precomputed):       2.65ms
+  select_nth + sort K:          0.31ms
+
+diag_breakdown (v0.49 T1a 优化实测 2026-11-09，单轮):
+  scan + L2 + collect:         60.01ms
+  execute_stages:              21.36ms
+  read_for_scan:               13.96ms
+  run_with_writer 完整:       107.75ms  （与 diag_pipeline 106.74 差 0.9%，交叉一致）
+
+diag_stages (v0.49 T1a 优化实测 2026-11-09，单轮):
+  execute_stages 完整:         17.17ms  （v0.48 24.29 → −7.1ms，MatchedLine 缩水红利）
+  apply_rank:                  14.26ms  （不变）
+  rank key extraction:         8.24ms   （≈8.72，噪声内）
+  sort_by (precomputed):       2.68ms
+  select_nth + sort K:          0.25ms
 ```
 
 #### v0.45 vs v0.41 execute_stages 差异归因
@@ -143,6 +259,24 @@ v0.45 diag_pipeline 的 execute_stages median 14.12ms vs v0.41 的 8.74ms（+61.
 - **gxp 2.42× 快于 GNU grep 3.0**（Windows 911MB 单文件，median 比值）
 - **限制声明**：(1) 单次 OS 调度波动较大，3 轮取 median 仅能消除部分噪声；(2) GNU grep 3.0 是 Windows 移植版，Linux GNU grep 3.11 性能可能不同，不可外推；(3) page cache 命中率影响实测，911MB < 16GB RAM 可能部分热读
 - **--verify 拒绝路径**：>512MB 单文件 `--verify` 不支持（流式 fallback 拒绝暴力对账），错误信息清晰提示用户
+
+#### ripgrep 对照（v0.47，2026-11-09，本机 i7-10700）
+
+> 补齐 AGENTS.md §6.1 声称的 gxp vs GNU grep vs ripgrep 三方对照。**原 911MB 数据集已不在本机**（v0.42 实测数据集未留存），本表用等价合成 JSONL：899.81 MiB / 6,700,000 行 / 均值 ~140B/行 / `"level":"ERROR"` 密度 1/5 = **1,340,000 行**（确定性生成，块复制法）。三方同文件同轮次交错实测（1 warmup + 3 轮 median，RAM 31.8GB 文件全量入 cache），全部直接进程调用（不经 msys 管道，避开本机 spawn 税，见 §1.1 机器变更说明）。
+
+| 工具（版本） | 命令 | R1 | R2 | R3 | median | spawn（`--version` median） | 剔除 spawn |
+|---|---|---|---|---|---|---|---|
+| gxp 0.47.0 release | `"ERROR" \| count`（流式 fallback） | 1454ms | 1454ms | 1459ms | **1454ms** | ~317ms | ~1137ms |
+| GNU grep 3.0（git 自带） | `grep -cE ERROR` | 1025ms | 1024ms | 1014ms | **1024ms** | ~92ms | ~932ms |
+| ripgrep 15.2.0 | `rg -c ERROR`（直连路径，runtime AVX2） | 581ms | 573ms | 575ms | **575ms** | ~89ms | ~486ms |
+| gxp 0.45.0（同机 A/B） | 同 v0.47 | 1496ms | 1446ms | 1488ms | **1488ms** | — | — |
+
+- **计数正确性**：三方输出均 = 1,340,000 = 独立计算期望值（670 万行 × 1/5）✓
+- **同机 A/B**：v0.45 ≈ v0.47（1488 vs 1454ms，±3% 噪声）→ B13/B14 及 v0.45→v0.47 流式路径零退化。**v0.42→v0.45 无法 A/B**（仓库 v0.45 squash 重建无 v0.42 commit；期间 B6-B11 动过流式 m.path 填充）
+- **诚实结论：本机本场景 ripgrep 最快**——gxp raw 慢于 rg 2.53× / 慢于 grep 1.42×；剔除 spawn 后 2.40× / 1.25×。gxp 差异化价值不在裸扫描吞吐（功能维度见 §6.3），此数据作为 v1.0 定位参考（P3 agent A/B 实验背景）
+- **与上方 v0.42 表（gxp 2.42× 快于 grep）不可跨表比值**：机器不同（i7-14700→i7-10700）+ 数据集不同（原 transcript 未留存，行长/密度分布不同——流式 count 的 per-line 开销对行数敏感：本数据集 670 万行 vs 原数据集行数未知）+ spawn 环境不同（本机 Defender 对当日新编译 gxp.exe 逐次收税 ~290ms）
+- **流式 fallback 吞吐参考**：gxp 流式 ~790 MiB/s（1137ms/900MB）vs read_to_end 路径 L1 扫描 1.31 GiB/s（§1.2 本机 33.44ms/44MB）vs rg ~1.9 GiB/s——流式路径存在优化空间，但 v1 优先级低（D10 已论证单查询主路径是 read_to_end，流式仅 >512MB fallback）
+- 限制声明：(1) spawn 分解中 Defender 实时扫描对"当日新编译/新安装"二进制逐次收税（gxp ~317ms、rg 经 scoop shim 首测 ~700ms / 直连 ~89ms），raw 列为实际用户感知值；(2) 单机单日 3 轮 median，轮间波动 <2%；(3) ripgrep 15.2 为 2026-11 新版本，SIMD runtime AVX2 开启
 
 #### 多样化数据集 L1+L2 验证（65MB server.log / 500K 行）
 
@@ -319,6 +453,8 @@ L3 ast() 大目录验证缺口已补齐：3378 文件 × 3 pattern × --verify =
 
 Arc<[u8]> 方案技术上可行，单文件 44MB 场景净收益不显著，大文件/大目录场景自动受益。
 
+> 2026-11-09 注：本表 "<80ms 目标" 为旧机 i7-14700 口径，v0.49 起降为历史参考；现行门禁见 AGENTS.md §7.1（本机基线锚点，median 劣化 >10% 需归因）。
+
 ### 1.6 性能改善归因分析（v0.32 → v0.41 → v0.45）
 
 > **结论**：v0.41 vs v0.32 和 v0.45 vs v0.41 的性能差异**都不是代码优化贡献**，而是系统 page cache 状态差异。v0.45 全管道 80.77ms 与 v0.41 的 80.30ms 一致（+0.6%），无退化。
@@ -336,6 +472,8 @@ Arc<[u8]> 方案技术上可行，单文件 44MB 场景净收益不显著，大�
 - 性能数据应报告"冷启动 + warm"两组，避免单次实测误导
 - v0.32 的 82.36ms、v0.41 的 80.30ms、v0.45 的 80.77ms 都在 80ms 目标边缘——**仍属达标**，但不要把版本间微小差异作为代码改进/退化证据
 - gxp 全管道性能瓶颈已归因清楚（v0.45: read 14% / L1 scan 22% / L2+collect 22% / execute_stages 17% / 差值 14%），无优化空间
+
+**v0.47 补记（2026-11-09，测量机变更归因）**：v0.47 复测全管道 128.09ms vs v0.45 记录 80.77ms 的差异**不是代码退化**，证据链：(1) 同机 A/B——v0.45 源码 worktree 本机实测 125.12ms ≈ v0.47 的 128.09ms（+2.4% 噪声级，B13/B14 后各阶段差异 ≤4.5%）；(2) 本机硬件（i7-10700 / OS build 26100）与 v0.32-v0.45 数据的环境标注（i7-14700 / 26200）双重不符，仓库在 v0.45 squash 重建时迁移；(3) 跨机比值 1.52-1.85× 均匀分布于所有 CPU 段而 read I/O 仅 1.17×（13.64 vs 11.69ms），符合"CPU 单核差距、存储同代"的机器特征；(4) 命中数完全一致（L1 141367 / L2 103607，确定性 fixture），语义零变化。**方法论教训：复测前先核对测量环境标注与本机实际硬件（一条 `Get-CimInstance Win32_Processor` 即可），环境不符时版本间绝对值比较无意义，应改用同机 A/B。**
 
 ---
 
@@ -475,6 +613,8 @@ cargo bench --bench full_pipeline --features l3-structural
 > 基于已有实测（gxp 76.31ms vs `gnu_grep -E | head -20` 212.68ms）+ 公开 benchmark 数据 + 架构分析推算。
 
 ### 6.1 单文件正则扫描（44MB 日志）
+
+> ⚠️ 本表为 v0.32 旧机估算，已被 §1.3.2「ripgrep 对照」实测取代（本机 900MB count 场景：**rg 最快，gxp 2.53× 慢于 rg**）。估算表仅作历史参考。
 
 | 工具 | 估算耗时 | vs gxp |
 |---|---|---|

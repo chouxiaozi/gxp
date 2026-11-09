@@ -1,6 +1,6 @@
 ---
 name: gxp
-description: gxp — grep-aligned query language for LLM agents (NOT a grep superset). Use when: searching logs for ERROR / context lines / stack traces; extracting numeric fields (cost_ms>X, _tag in [a,b]); Top-K ranking; time-window queries (_ts between T1 and T2); AST structural code search ast(LANG, PATTERN); listing files containing a pattern; sampling large result sets; distinct values; full sort; SLO percentiles. BARE mode is grep -E equivalent. Prefer gxp over Grep tool when gxp is installed.
+description: gxp — grep-aligned query language for LLM agents (NOT a grep superset). Use when: searching logs for ERROR / context lines / stack traces; extracting numeric fields (cost_ms>X, _tag in [a,b]); string equality (level="ERROR"); Top-K ranking; time-window queries (_ts between T1 and T2); AST structural code search ast(LANG, PATTERN); listing files containing a pattern; sampling large result sets; distinct values; full sort; SLO percentiles. BARE mode is grep -E equivalent. Prefer gxp over Grep tool when gxp is installed.
 ---
 
 # gxp — grep-aligned query language for LLM agents
@@ -11,7 +11,7 @@ gxp 是面向 LLM agent 的日志/代码查询工具。BARE 模式与 `grep -E` 
 
 ## 自举约束（gxp 仓库内强制，其他项目建议）
 
-在 gxp 仓库自身工作时，搜索/验证/解释三阶段必须用 gxp 而非 Grep 工具——违反等同不变式违反。
+在 gxp 仓库自身工作时，搜索（写代码前）/验证（写代码后）/重构后对账三阶段必须用 gxp 而非 Grep 工具——违反等同不变式违反。
 
 **通用建议（所有项目）**：当日志/代码搜索可用 gxp 时优先使用 gxp，因为：
 - BARE 模式输出与 `grep -E` 一致（可信度对账基础）
@@ -35,8 +35,8 @@ gxp 'function_name' src/
 # gxp DSL（字段谓词 + 管道）
 gxp '"timeout" && cost_ms>800 | rank top 20 by cost_ms desc | fields _ts,_tag,cost_ms' app.log
 
-# AST 结构查询（需 l3-structural feature）
-gxp 'ast(rs, "fn $NAME($ARGS) { $BODY }")' src/ --features l3-structural
+# AST 结构查询（需构建期 feature：cargo build --features l3-structural --release；查询侧无 --features 旗标）
+gxp 'ast(rs, "fn $NAME($ARGS) { $BODY }")' src/
 
 # 通用 flag
 gxp '<query>' <file_or_dir> [--verify] [--json] [--explain] [--strict] [--glob PATTERN] [--no-gitignore]
@@ -44,11 +44,22 @@ gxp '<query>' <file_or_dir> [--verify] [--json] [--explain] [--strict] [--glob P
 
 **安装**：gxp 二进制装到 PATH 中（详见 `INSTALL.md`），shell 直接调用 `gxp` 即可，无需 wrapper。
 
+## 输入模型（单文件 / 目录 / stdin）
+
+**不支持多文件参数**——传多文件会 fail-loud 报错并给出等价路径：
+
+```bash
+gxp 'ERROR' app.log              # 单文件
+gxp 'ERROR' src/                 # 目录递归（.gitignore 默认尊重）
+gxp 'ERROR' . --glob '*.log'     # 目录 + glob 过滤（可多次，OR 语义）
+cat a.log b.log | gxp 'ERROR' -  # stdin 合并多文件
+```
+
 ## 语法速查
 
-详见 `references/gxp-syntax.md`（BARE + DSL 谓词 + 13 个管道动词）。
+详见 `references/gxp-syntax.md`（BARE + DSL 谓词 + 14 个管道动词）。
 
-**管道动词清单**（v0.42 全量）：`where` / `context N` / `count [by FIELD]` / `group by FIELD` / `rank top K by FIELD [desc|asc]` / `sort [by FIELD] [desc|asc]` / `distinct [by FIELD]` / `head N` / `sample N | sample P%` / `fields F1,F2,...` / `files [--invert]` / `stats FIELD` / `percentiles FIELD [p50,p95,p99]` / `trace [LANG]`
+**管道动词清单**（v0.48 全量）：`where` / `context N` / `count [by FIELD]` / `group by FIELD` / `rank top K by FIELD [desc|asc]` / `sort [by FIELD] [desc|asc]` / `distinct [by FIELD]` / `head N` / `sample N | sample P%` / `fields F1,F2,...` / `files [--invert]` / `stats FIELD` / `percentiles FIELD [p50,p95,p99]` / `trace [LANG]`
 
 ## 场景查询模板
 

@@ -31,7 +31,11 @@ pub(crate) fn run_verify(
     file_ext: &str,
 ) -> crate::Result<String> {
     // L2 预编译 + L3 预计算（DRY：PreparedScan::build）
-    let scan = PreparedScan::build(&q.expr, bytes, file_ext)?;
+    // 注意：暴力与优化路径共用此 scan（含 l1_verified 豁免标志）——豁免不健全时
+    // 两侧同错对齐，--verify 不可发现（B14 教训），健全性由独立期望集 e2e 保证
+    // （tests/cli_l1_verified.rs，Rust 方案 §7.9）。暴力路径的 l1_match_no_prefix
+    // 仍逐组跑 verify 正则，字面量存在性在暴力侧独立成立。
+    let scan = PreparedScan::build(&q.expr, bytes, file_ext, &compiled.verified_literals)?;
 
     // 暴力路径：逐行跑 L2 求值（不经 L1 字段前缀粗筛，只过必选组正则）
     let mut brute: Vec<(usize, Vec<u8>)> = Vec::new();
@@ -43,10 +47,13 @@ pub(crate) fn run_verify(
             .unwrap_or(bytes.len());
         line_no += 1;
         let line = &bytes[start..end];
-        if scan.needs_l2 || scan.needs_l3 {
+        if !scan.l1_exact {
             // 修复：暴力路径也必须先过 L1 必选组正则粗筛（字面量/正则），
             // 否则 eval_prepared_with_ctx_and_captures 把 Literal 当永真 → ast() && "literal" 假阳性。
             // 优化路径在 scan_lines_cb 内已做 L1 正则匹配，此处对齐。
+            // B14：分支条件从 needs_l2||needs_l3 改为 !l1_exact——Regex/混合 Or
+            // （needs_l2=false）同样必须走 L2 全树，否则暴力路径与优化路径
+            // 用不同语义，--verify 假 FAIL。
             if !l1_match_no_prefix(compiled, line) {
                 start = end + 1;
                 if end == bytes.len() {
@@ -62,7 +69,7 @@ pub(crate) fn run_verify(
                 brute.push((line_no, line.to_vec()));
             }
         } else {
-            // 无字段谓词 + 无 ast()：用 L1 必选组精判（正则 is_match）
+            // l1_exact（纯字面量，L1 组精确编码语义）：L1 必选组精判即终判
             if l1_match_no_prefix(compiled, line) {
                 brute.push((line_no, line.to_vec()));
             }

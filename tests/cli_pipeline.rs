@@ -2312,3 +2312,136 @@ fn test_not_regex_with_pattern_not_literal() {
         "含 error 的行应被 Not 淘汰: {out}"
     );
 }
+
+// ===== B14：无括号混合 &&/|| + Regex 在布尔组合中的 L1 健全性 =====
+//
+// 根因（v0.47 修复）：l1::compiler 对 Or 中不推进字面量的分支（And/Not/Regex/
+// Pred/Ast/Capture）静默跳过，剩余分支的字面量仍组成「必选组」→ 部分组误杀
+// 其余分支候选（L1 ⊇ L2 违反）；且 scan 捷径 `!needs_l2`（只看字段谓词）把
+// 纯字面量查询当 "L1 即终判"——Regex 右支从不检查、混合 Or 直接 match-all。
+// 夹具（5 行，期望集独立计算）：
+//   1 "trace json"  2 "trace stdin"  3 "neither"  4 "json only"  5 "stdin only"
+
+/// B14 夹具：write_temp 包一份标准 5 行布尔夹具。
+fn bool_fixture() -> tempfile::NamedTempFile {
+    write_temp("trace json\ntrace stdin\nneither\njson only\nstdin only\n")
+}
+
+#[test]
+fn test_bool_mixed_and_or_four_terms_exact() {
+    // (trace∧json) ∨ (trace∧stdin) = {1,2}——修复前 match-all 5 行
+    let f = bool_fixture();
+    let out = run(&args(
+        r#""trace" && "json" || "trace" && "stdin""#,
+        f.path().to_str().unwrap(),
+    ))
+    .expect("混合 4 项应成功");
+    assert!(out.contains("1:trace json"), "{out}");
+    assert!(out.contains("2:trace stdin"), "{out}");
+    assert!(!out.contains("neither"), "无关行不得命中: {out}");
+    assert!(!out.contains("only"), "only 行不得命中: {out}");
+}
+
+#[test]
+fn test_bool_mixed_and_or_three_terms_and_first() {
+    // (trace∧json) ∨ stdin = {1,2,5}——修复前只剩 {2,5}（And 分支被部分组误杀）
+    let f = bool_fixture();
+    let out = run(&args(
+        r#""trace" && "json" || "stdin""#,
+        f.path().to_str().unwrap(),
+    ))
+    .expect("应成功");
+    assert!(
+        out.contains("1:trace json"),
+        "And 分支候选行 1 不得被 L1 误杀: {out}"
+    );
+    assert!(out.contains("2:trace stdin"), "{out}");
+    assert!(out.contains("5:stdin only"), "{out}");
+    assert!(!out.contains("neither"), "{out}");
+    assert!(!out.contains("4:json only"), "{out}");
+}
+
+#[test]
+fn test_bool_mixed_and_or_three_terms_or_first() {
+    // json ∨ (trace∧stdin) = {1,2,4}——修复前只剩 {1,4}（右侧 And 分支被误杀）
+    let f = bool_fixture();
+    let out = run(&args(
+        r#""json" || "trace" && "stdin""#,
+        f.path().to_str().unwrap(),
+    ))
+    .expect("应成功");
+    assert!(out.contains("1:trace json"), "{out}");
+    assert!(
+        out.contains("2:trace stdin"),
+        "And 分支候选行 2 不得被 L1 误杀: {out}"
+    );
+    assert!(out.contains("4:json only"), "{out}");
+    assert!(!out.contains("neither"), "{out}");
+    assert!(!out.contains("5:stdin only"), "{out}");
+}
+
+#[test]
+fn test_bool_and_with_regex_rhs_checked_by_l2() {
+    // json ∧ /onl/ = {4}——修复前 Regex 右支从不检查（{1,4} 假阳性）
+    let f = bool_fixture();
+    let out = run(&args(r#""json" && /onl/"#, f.path().to_str().unwrap())).expect("应成功");
+    assert!(out.contains("4:json only"), "{out}");
+    assert!(
+        !out.contains("1:trace json"),
+        "不匹配 /onl/ 的行不得命中（Regex 必须被 L2 检查）: {out}"
+    );
+}
+
+#[test]
+fn test_bool_or_with_regex_branch_keeps_regex_hits() {
+    // json ∨ /neith/ = {1,3,4}——修复前只匹配正则的行被部分组误杀（{1,4}）
+    let f = bool_fixture();
+    let out = run(&args(r#""json" || /neith/"#, f.path().to_str().unwrap())).expect("应成功");
+    assert!(
+        out.contains("3:neither"),
+        "只匹配 Regex 分支的行不得被 L1 误杀（L1 ⊇ L2）: {out}"
+    );
+    assert!(out.contains("1:trace json"), "{out}");
+    assert!(out.contains("4:json only"), "{out}");
+    assert!(!out.contains("stdin"), "{out}");
+}
+
+#[test]
+fn test_bool_mixed_and_or_verify_agrees() {
+    // --verify 对账混合 4 项：两条路径（暴力/优化）语义一致且结果正确（2 行）
+    let f = bool_fixture();
+    let out = run(&args(
+        r#""trace" && "json" || "trace" && "stdin""#,
+        f.path().to_str().unwrap(),
+    ))
+    .expect("应成功");
+    let verify = run_with_opts(
+        &args(
+            r#""trace" && "json" || "trace" && "stdin""#,
+            f.path().to_str().unwrap(),
+        ),
+        RunOpts {
+            verify: true,
+            ..Default::default()
+        },
+    )
+    .expect("--verify 应成功");
+    assert!(verify.contains("PASS [2 行命中]"), "verify: {verify}");
+    assert!(out.lines().count() == 2, "命中应为 2 行: {out}");
+}
+
+#[test]
+fn test_where_bool_mixed_semantics() {
+    // B14 where 路径：apply_where 捷径同修——`| where "x" && "y" || "z"` = (x∧y)∨z
+    let f = write_temp("err x y\nerr x z\nerr x\nerr z\nplain\n");
+    let out = run(&args(
+        r#""err" | where "x" && "y" || "z""#,
+        f.path().to_str().unwrap(),
+    ))
+    .expect("where 混合布尔应成功");
+    assert!(out.contains("1:err x y"), "x∧y 命中: {out}");
+    assert!(out.contains("2:err x z"), "z 命中: {out}");
+    assert!(out.contains("4:err z"), "z 命中: {out}");
+    assert!(!out.contains("3:err x"), "仅 x 不满足 (x∧y)∨z: {out}");
+    assert!(!out.contains("plain"), "非 err 行不得进入 where: {out}");
+}

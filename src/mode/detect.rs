@@ -90,14 +90,34 @@ fn has_field_predicate(pattern: &str) -> bool {
     while i + 1 < bytes.len() {
         let b = bytes[i];
         let next = bytes[i + 1];
-        // 字母后跟 >、<、=、!（可能是字段谓词，如 cost_ms>800）
-        // 排除 BARE 里的 ERE 元字符（如 a|b 不触发）
-        if b.is_ascii_alphabetic() && (next == b'>' || next == b'<' || next == b'!' || next == b'=')
-        {
-            // 进一步检查：字母前是否是字母（字段名中部不算）
-            // 简化：只要字母后跟 >、<、!、= 就判为字段谓词特征
-            // 误判场景：BARE 里 `a=b`（ERE 里 = 是字面）——但 gxp 字段谓词语义优先
+        // 字母后跟 >、<、!（可能是字段谓词，如 cost_ms>800）
+        if b.is_ascii_alphabetic() && (next == b'>' || next == b'<' || next == b'!') {
             return true;
+        }
+        // v0.48：`=` 需 RHS 前瞻——越过连续 `=` 与空白后首字符是数字/`-`/`+`/`.`
+        // 才判谓词特征（数值等值，D5）；带引号 RHS（字符串等值）由外层双引号规则
+        // 先行命中。单 `=` 非数值 RHS（如 `a=b`）是 ERE 字面量（设计文档 §2.2：
+        // `=` 不在 BARE 谓词分歧操作符列表），不触发 gxp 模式；`==`（≥2 个连续）
+        // 是有意分歧操作符，无条件触发（非数值 RHS 由编译期 D5 拒绝，fail-loud 不变）。
+        if b.is_ascii_alphabetic() && next == b'=' {
+            let mut j = i + 1;
+            let mut eq_count = 0usize;
+            while j < bytes.len() && bytes[j] == b'=' {
+                eq_count += 1;
+                j += 1;
+            }
+            if eq_count >= 2 {
+                return true;
+            }
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if let Some(&c) = bytes.get(j) {
+                if c.is_ascii_digit() || c == b'-' || c == b'+' || c == b'.' {
+                    return true;
+                }
+            }
+            // 非数值 RHS：不是谓词特征，继续扫描（后面可能还有其他特征）
         }
         i += 1;
     }
@@ -112,6 +132,31 @@ fn has_field_predicate(pattern: &str) -> bool {
     // `stats ` 管道动词
     if pattern.contains("stats ") || pattern.ends_with(" stats") {
         return true;
+    }
+    false
+}
+
+/// 宽松扫描（v0.48，仅错误文案用）：`"` 前最近的非空白 token 是否为非等值比较
+/// 操作符（`!=`/`>`/`>=`/`<`/`<=`）——`level>"ERROR"` / `level!="ERROR"` 类误写。
+///
+/// 语义拦截在 parser 层（`quoted_wrong_op_shape` fail-loud，REGEX/STRING 已优先
+/// 解析不会误伤）；本函数只在解析已失败后决定是否附加 hint，误报仅影响文案。
+pub(crate) fn has_quoted_wrong_op(pattern: &str) -> bool {
+    let b = pattern.as_bytes();
+    for (i, &c) in b.iter().enumerate() {
+        if c != b'"' {
+            continue;
+        }
+        // 向前收集连续的操作符字符（= ! < >）
+        let mut j = i;
+        while j > 0 && matches!(b[j - 1], b'=' | b'!' | b'>' | b'<') {
+            j -= 1;
+        }
+        let token = &pattern[j..i];
+        // 存在操作符 token 且不是纯等值（= / ==）→ 误用形态
+        if !token.is_empty() && token != "=" && token != "==" {
+            return true;
+        }
     }
     false
 }
@@ -141,6 +186,52 @@ pub(crate) fn has_any_predicate(expr: &Expr) -> bool {
         Expr::Prim(Prim::Capture { .. }) => true,
         Expr::Prim(Prim::Ast { .. }) => false,
         Expr::Prim(Prim::String(_) | Prim::Regex(_) | Prim::Bare(_)) => false,
+    }
+}
+
+/// 判定表达式的字面量语义是否被 L1 必选组「精确编码」（B14）。
+///
+/// [`scan_and_collect`] 的捷径（L1 命中即收集，跳过 L2 全树求值）只在
+/// 此返回 `true` 时安全：
+/// - `String`/`Bare` 字面量经 `&&` 拆组（组间 AND）、`||` 合组（组内
+///   any-hit）组合时，L1 组与表达式语义完全一致
+/// - 其余形态一律 `false`，必须走 L2 全树精判：
+///   - `Regex`：L1 不推进字面量（`"a" && /re/` 的正则右支 L1 从不检查）
+///   - `Not`：v0.42 起 L1 不下推 Not 内部字面量，L2 承担取反
+///   - `Pred`/`Capture`：needs_l2 本就为 true
+///   - `Ast`：needs_l3 路径
+///   - **Or 混合非字面量分支**：L1 组被整体放弃（B14，见
+///     `l1::compiler::collect_or_literals` 完整性规则——Or 分支判定
+///     必须镜像该规则，不能递归 [`l1_exact`]：`Or(And(a,b), c)` 中
+///     `l1_exact(And)=true`，但该 And 分支根本没进组）
+pub(crate) fn l1_exact(expr: &Expr) -> bool {
+    match expr {
+        Expr::And(l, r) => l1_exact(l) && l1_exact(r),
+        // Or 合组只对「两侧均为可进组的字面量组合」精确（or_complete
+        // 与 compiler::collect_or_literals 完整性规则同构）
+        Expr::Or(l, r) => or_complete(l) && or_complete(r),
+        Expr::Not(_) => false,
+        Expr::Prim(prim) => prim_literal_complete(prim),
+    }
+}
+
+/// Or 子树的完整性：每个分支都是推进字面量的 prim（String/Bare，
+/// 或括号包裹的同构组合）。与 `l1::compiler::collect_or_literals` 同构。
+fn or_complete(expr: &Expr) -> bool {
+    match expr {
+        Expr::Or(l, r) => or_complete(l) && or_complete(r),
+        Expr::Prim(prim) => prim_literal_complete(prim),
+        Expr::And(..) | Expr::Not(_) => false,
+    }
+}
+
+/// prim 是否推进字面量（可进 Or 组）。与
+/// `l1::compiler::collect_prim_literals` 的返回值语义同构。
+fn prim_literal_complete(prim: &Prim) -> bool {
+    match prim {
+        Prim::String(_) | Prim::Bare(_) => true,
+        Prim::Paren(e) => or_complete(e),
+        Prim::Regex(_) | Prim::Pred(_) | Prim::Ast { .. } | Prim::Capture { .. } => false,
     }
 }
 
@@ -213,6 +304,9 @@ pub(crate) struct PreparedScan {
     pub prepared: PreparedExpr,
     /// 是否含字段谓词（`has_any_predicate` 产物）。
     pub needs_l2: bool,
+    /// 字面量语义是否被 L1 必选组精确编码（`l1_exact` 产物，B14）。
+    /// `scan_and_collect` 捷径（L1 命中即收集）仅在此为 true 时启用。
+    pub l1_exact: bool,
     /// 是否含 ast() 节点（feature 关闭时恒 false）。
     pub needs_l3: bool,
     /// L3 ast() 预计算行号集合（`needs_l3 == false` 时为 `None`）。
@@ -223,11 +317,21 @@ pub(crate) struct PreparedScan {
 impl PreparedScan {
     /// 一次性构建 L2 求值上下文：`prepare_expr` + `has_any_predicate` + L3 预计算。
     ///
+    /// `verified`：`CompiledL1::verified_literals`（v0.49 Opt A）——L1 已构造性
+    /// 保证存在的字面量，L2 豁免重校验。调用方（gxp 模式 / verify）均持有
+    /// 同一 `compiled`，传 `&compiled.verified_literals`。
+    ///
     /// 取代原 3 处复制粘贴的 cfg block（`run_gxp_mode_with_content` /
     /// `run_gxp_mode_directory` / `run_verify`）。
-    pub(crate) fn build(expr: &Expr, bytes: &[u8], file_ext: &str) -> crate::Result<Self> {
-        let prepared = prepare_expr(expr)?;
+    pub(crate) fn build(
+        expr: &Expr,
+        bytes: &[u8],
+        file_ext: &str,
+        verified: &[Vec<u8>],
+    ) -> crate::Result<Self> {
+        let prepared = prepare_expr(expr, verified)?;
         let needs_l2 = has_any_predicate(expr);
+        let l1_exact = l1_exact(expr);
 
         #[cfg(feature = "l3-structural")]
         {
@@ -236,6 +340,7 @@ impl PreparedScan {
             Ok(Self {
                 prepared,
                 needs_l2,
+                l1_exact,
                 needs_l3,
                 ast_lines,
             })
@@ -260,6 +365,7 @@ impl PreparedScan {
             Ok(Self {
                 prepared,
                 needs_l2,
+                l1_exact,
                 needs_l3: false,
             })
         }
@@ -341,6 +447,7 @@ impl PreparedScan {
             Ok(Self {
                 prepared: scan.prepared.clone(),
                 needs_l2: scan.needs_l2,
+                l1_exact: scan.l1_exact,
                 needs_l3: scan.needs_l3,
                 ast_lines,
             })
@@ -351,6 +458,7 @@ impl PreparedScan {
             Ok(Self {
                 prepared: scan.prepared.clone(),
                 needs_l2: scan.needs_l2,
+                l1_exact: scan.l1_exact,
                 needs_l3: false,
             })
         }
@@ -400,8 +508,13 @@ fn prepare_l3(
 /// 取代 4 处 `scan_lines_cb` + 回调内 `eval_line` + `cfg` 分支的复制粘贴：
 /// `run_gxp_mode_with_content` / `run_gxp_mode_directory` / `run_verify` 暴力+优化路径。
 ///
-/// 语义：`needs_l2 == false && needs_l3 == false` 时 L1 命中即收集（字面量/正则已由
-/// L1 必选组保证）；否则每行调 `scan.is_hit_with_captures` 做 L2 精判 + capture 提取。
+/// 语义（B14 修复后）：捷径（L1 命中即收集，跳过 L2）只在 `scan.l1_exact`
+/// 时启用——即表达式是纯 String/Bare 字面量经 `&&`/`||` 组合、L1 必选组
+/// 与语义完全一致（And 拆组组间 AND、Or 合组组内 any-hit）。
+/// 原条件 `!needs_l2 && !needs_l3` 不健全：`needs_l2` 只看字段谓词，
+/// Regex / 混合 Or 的字面量语义 L1 并未编码（`"a" && /re/` 的正则右支
+/// 从不检查、`"a" && "b" || "c"` 的 And 分支被部分组误杀）。
+/// 非 `l1_exact` 时每行调 `scan.is_hit_with_captures` 做 L2 全树精判 + capture 提取。
 ///
 /// capture 提取的值写入 `MatchedLine::captures`，供 `fields` 投影使用。
 pub(crate) fn scan_and_collect(
@@ -411,7 +524,7 @@ pub(crate) fn scan_and_collect(
 ) -> Vec<crate::pipeline::MatchedLine> {
     let mut matched: Vec<crate::pipeline::MatchedLine> = Vec::new();
     scan_lines_cb(compiled, bytes, |line_no, line| {
-        if !scan.needs_l2 && !scan.needs_l3 {
+        if scan.l1_exact {
             let mut m = crate::pipeline::MatchedLine::new(line_no, line);
             m.match_bytes = find_match_bytes(compiled, line);
             matched.push(m);
@@ -456,7 +569,9 @@ pub(crate) fn scan_and_collect_stream(
 
     let mut matched: Vec<crate::pipeline::MatchedLine> = Vec::new();
     scan_stream_lines_cb(compiled, path, |line_no, line| {
-        if !scan.needs_l2 {
+        // B14：与 scan_and_collect 同款捷径门槛——仅 l1_exact（纯字面量
+        // 且 L1 组精确编码语义）时 L1 命中即收集；Regex/混合 Or 走 L2 全树。
+        if scan.l1_exact {
             let mut m = crate::pipeline::MatchedLine::new(line_no, line);
             m.match_bytes = find_match_bytes(compiled, line);
             matched.push(m);
@@ -479,23 +594,32 @@ pub(crate) fn scan_and_collect_stream(
 /// 查找 L1 匹配的字节内容（用于伪字段 `_match`，等价 `grep -o`）。
 ///
 /// 从第一个必选字面量组提取第一个命中的字面量。
-/// - 纯字面量组：aho-corasick `find` 返回的字面量。
+/// - 单元素纯字面量组（v0.49 Opt B 快速路径）：L1 幸存行必含该字面量，
+///   直接 Arc clone 免 aho 二次查找 + 每行 Vec 分配（~3.6ms/44MB 实测）。
+/// - 多元素纯字面量组：aho-corasick `find` 返回的字面量（需鉴别命中者）。
 /// - 含 Regex 组：`verify.find` 返回的正则匹配字节。
 /// - 无必选组（纯字段谓词）：返回 None（无字面量可提取）。
-fn find_match_bytes(compiled: &crate::l1::compiler::CompiledL1, line: &[u8]) -> Option<Vec<u8>> {
+fn find_match_bytes(
+    compiled: &crate::l1::compiler::CompiledL1,
+    line: &[u8],
+) -> Option<std::sync::Arc<[u8]>> {
     let grp = compiled.required_groups.first()?;
+    // Opt B 快速路径：单元素纯字面量组命中即确定（组 any-hit ≡ 该字面量存在）
+    if grp.is_pure_literal && grp.literals.len() == 1 {
+        return Some(std::sync::Arc::clone(&grp.literals[0]));
+    }
     // 优先用 aho-corasick find（获取命中的字面量 pattern）
     if let Some(m) = grp.fast.find(line) {
         // 纯字面量组：返回命中的字面量字节
         if grp.is_pure_literal {
             let pat_idx = m.pattern().as_usize();
             if let Some(lit) = grp.literals.get(pat_idx) {
-                return Some(lit.clone());
+                return Some(std::sync::Arc::clone(lit));
             }
         }
         // 含 Regex 组：用 verify.find 获取正则匹配的字节
         if let Some(regex_match) = grp.verify.find(line) {
-            return Some(regex_match.as_bytes().to_vec());
+            return Some(std::sync::Arc::from(regex_match.as_bytes()));
         }
     }
     None
@@ -712,6 +836,36 @@ mod tests {
     }
 
     #[test]
+    fn test_is_gxp_mode_eq_predicate_lookahead_v048() {
+        // `=` 数值 RHS → 谓词特征（gxp 模式），v0.47 行为保留
+        assert!(is_gxp_mode("cost_ms=800"));
+        assert!(is_gxp_mode("cost_ms= 800"));
+        assert!(is_gxp_mode("cost_ms=-5"));
+        assert!(is_gxp_mode("cost_ms=.5"));
+        // `=` 单等号非数值 RHS → ERE 字面量，BARE 模式（v0.48 对齐设计文档）
+        assert!(!is_gxp_mode("a=b"));
+        assert!(!is_gxp_mode("level=ERROR"));
+        // `==` 有意分歧操作符 → 仍 gxp 模式（非数值 RHS 编译期 D5 拒绝）
+        assert!(is_gxp_mode("a==b"));
+        // 字符串等值：双引号规则命中（不受本前瞻影响）
+        assert!(is_gxp_mode(r#"level="ERROR""#));
+    }
+
+    #[test]
+    fn test_has_quoted_wrong_op_scan() {
+        // 误用形态：非等值操作符 + 引号 RHS
+        assert!(has_quoted_wrong_op(r#"level>"ERROR""#));
+        assert!(has_quoted_wrong_op(r#"level!="ERROR""#));
+        assert!(has_quoted_wrong_op(r#"cost_ms>="800""#));
+        // 等值操作符带引号 = 合法脱糖，不误报
+        assert!(!has_quoted_wrong_op(r#"level="ERROR""#));
+        assert!(!has_quoted_wrong_op(r#"level=="ERROR""#));
+        // 无操作符邻接的引号（字面量并列 / ast 模式）
+        assert!(!has_quoted_wrong_op(r#""a" && "b""#));
+        assert!(!has_quoted_wrong_op(r#"ast(ts, "useQuery($A)")"#));
+    }
+
+    #[test]
     fn test_is_gxp_mode_pipeline() {
         assert!(is_gxp_mode("ERROR | context 3"));
         assert!(is_gxp_mode("ERROR | count"));
@@ -844,6 +998,69 @@ mod tests {
         assert!(has_any_predicate(&expr));
     }
 
+    // --- B14：l1_exact 判定 + Or(And, Prim) 全链不得 match-all ---
+
+    #[test]
+    fn test_l1_exact_pure_literals_true() {
+        // "a" && "b" / "a" || "b" / ("a" || "b") && "c"：L1 组精确编码
+        for q in [
+            r#""trace" && "json""#,
+            r#""json" || "stdin""#,
+            r#""trace" && ("json" || "stdin")"#,
+            r#"("json" || "stdin") && "trace""#,
+            r#""a" || "b" || "c""#,
+        ] {
+            let expr = crate::dsl::parser::parse_query(q).unwrap().expr;
+            assert!(l1_exact(&expr), "应为 l1_exact: {q}");
+        }
+    }
+
+    #[test]
+    fn test_l1_exact_regex_not_or_mixed_false() {
+        // Regex / 混合 Or / Not / 谓词：L1 组不完整，必须走 L2
+        for q in [
+            r#""json" && /onl/"#,
+            r#""json" || /neith/"#,
+            r#""trace" && "json" || "stdin""#,
+            r#""json" || "trace" && "stdin""#,
+            r#"("trace" && "json") || "stdin""#,
+            r#"!("trace")"#,
+            r#"cost_ms>800"#,
+        ] {
+            let expr = crate::dsl::parser::parse_query(q).unwrap().expr;
+            assert!(!l1_exact(&expr), "不应为 l1_exact: {q}");
+        }
+    }
+
+    #[test]
+    fn test_b14_scan_and_collect_mixed_and_or() {
+        // B14 核心回归：Or(And("trace","json"), "stdin") 不得 match-all
+        let expr = crate::dsl::parser::parse_query(r#""trace" && "json" || "stdin""#)
+            .unwrap()
+            .expr;
+        assert!(!l1_exact(&expr), "混合 Or 必须 l1_exact=false");
+        let compiled = crate::l1::compiler::compile(&expr).unwrap();
+        let scan = PreparedScan::build(&expr, &[], "", &[]).unwrap();
+        let bytes = b"trace json\ntrace stdin\nneither\njson only\nstdin only\n";
+        let matched = scan_and_collect(&compiled, &scan, bytes);
+        let line_nos: Vec<usize> = matched.iter().map(|m| m.line_no).collect();
+        assert_eq!(line_nos, vec![1, 2, 5], "期望 (t∧j)∨s = 行 1/2/5");
+    }
+
+    #[test]
+    fn test_b14_scan_and_collect_regex_in_bool() {
+        // B14 Regex 家族回归：正则右支必须被 L2 检查
+        let expr = crate::dsl::parser::parse_query(r#""json" && /onl/"#)
+            .unwrap()
+            .expr;
+        let compiled = crate::l1::compiler::compile(&expr).unwrap();
+        let scan = PreparedScan::build(&expr, &[], "", &[]).unwrap();
+        let bytes = b"trace json\njson only\n";
+        let matched = scan_and_collect(&compiled, &scan, bytes);
+        assert_eq!(matched.len(), 1, "只有 json only 同时满足字面量与正则");
+        assert_eq!(matched[0].line_no, 2);
+    }
+
     // --- V1: PreparedScan Send+Sync 编译断言 ---
     //
     // 路线图 §11.2 V1 要求验证 PreparedScan（含 ast-grep 产物）是否 Send+Sync，
@@ -923,7 +1140,7 @@ mod tests {
         use crate::dsl::parser::parse_query;
         // ast(rs, "fn main") → PreparedScan::build 应报错（fail-loud，引导重建）
         let q = parse_query(r#"ast(rs, "fn main")"#).expect("parse 应成功");
-        let r = PreparedScan::build(&q.expr, b"", "");
+        let r = PreparedScan::build(&q.expr, b"", "", &[]);
         let err = match r {
             Ok(_) => panic!("应 fail-loud 报错，但 build 成功返回"),
             Err(e) => format!("{e}"),
@@ -938,7 +1155,7 @@ mod tests {
     fn test_prepared_scan_build_passes_non_ast_query() {
         // 非 ast 查询在无 l3-structural 下应正常 build
         let q = crate::dsl::parser::parse_query(r#""ERROR""#).expect("parse 应成功");
-        let r = PreparedScan::build(&q.expr, b"", "");
+        let r = PreparedScan::build(&q.expr, b"", "", &[]);
         assert!(r.is_ok(), "非 ast 查询应正常 build");
     }
 
@@ -949,7 +1166,7 @@ mod tests {
         let q = crate::dsl::parser::parse_query(r#"ast(rs, "fn main")"#).expect("parse 应成功");
         // 空 bytes → ast-grep find_all 在空字符串上跑（rs 文件不能为空字符串，
         // 但函数应不报"feature 未编译"错误，而是返回 Result<Ok 或 L3 错误>）
-        let r = PreparedScan::build(&q.expr, b"fn main() {}", "rs");
+        let r = PreparedScan::build(&q.expr, b"fn main() {}", "rs", &[]);
         // 不应报 l3-structural 未编译错误
         match r {
             Ok(_) => {} // 正常

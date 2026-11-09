@@ -77,6 +77,54 @@ fn test_trace_rust_panicked_continuation() {
 }
 
 #[test]
+fn test_trace_rust_new_format_panicked_e2e() {
+    // B13 e2e：新格式（Rust ≥1.65）panic——消息行顶格在头行下一行 + note:
+    // 用自动检测（`| trace` 不带 lang）覆盖 detect_lang 对新格式头行的识别
+    let f = write_temp(
+        "2026-11-09T10:00:06.000Z INFO [api] msg=ok\n\
+         thread 'main' panicked at src/main.rs:42:18:\n\
+         called `Result::unwrap()` on an `Err` value: ParseError\n\
+         note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\
+         2026-11-09T10:00:08.000Z ERROR [api] msg=upstream_timeout\n",
+    );
+    let out = run(&args(r#""panic" | trace"#, f.path().to_str().unwrap()))
+        .expect("trace（自动检测 rust）应成功");
+    assert!(out.contains("panicked at src/main.rs:42:18:"), "{out}");
+    // 消息行 + note: 两个续行都以 `  → ` 收进同一条记录
+    assert!(
+        out.contains("  → called `Result::unwrap()`"),
+        "新格式消息行应作为续行捕获: {out}"
+    );
+    assert!(out.contains("  → note: run with"), "{out}");
+    // panic 后的正常日志行不属于 trace，不得被收
+    assert!(!out.contains("upstream_timeout"), "{out}");
+}
+
+#[test]
+fn test_trace_rust_new_format_backtrace_at_lines_e2e() {
+    // B13 同族 e2e：RUST_BACKTRACE=1 真实形态——帧间缩进 `at <path>:<line>:<col>` 位置行
+    let f = write_temp(
+        "thread 'main' panicked at src/main.rs:42:18:\n\
+         called `Result::unwrap()` on an `Err` value: ParseError\n\
+         stack backtrace:\n\
+         \x20  0: gxp::l2::extract::find_value\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20 at ./src/l2/extract.rs:88:24\n\
+         \x20  1: gxp::mode::eval::eval_prepared\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20 at ./src/mode/eval.rs:210:9\n\
+         next non-trace line\n",
+    );
+    let out = run(&args(r#""panic" | trace rust"#, f.path().to_str().unwrap()))
+        .expect("trace rust 应成功");
+    // 消息 1 + stack backtrace: 1 + 帧 2 + at 2 = 6 个续行
+    let arrow_count = out.matches("  → ").count();
+    assert_eq!(arrow_count, 6, "应收集 6 行续行（含帧间 at 行）: {out}");
+    assert!(out.contains("  → called `Result::unwrap()`"), "{out}");
+    assert!(out.contains("at ./src/l2/extract.rs:88:24"), "{out}");
+    assert!(out.contains("at ./src/mode/eval.rs:210:9"), "{out}");
+    assert!(!out.contains("next non-trace line"), "{out}");
+}
+
+#[test]
 fn test_trace_go_goroutine_frame() {
     // gxp 'panic | trace go' file：go panic 含 goroutine [running]: + .go:N 帧
     let f = write_temp(

@@ -96,9 +96,14 @@ pub(crate) fn eval_prepared_prim_with_captures(
 ) -> EvalResult {
     match prim {
         PreparedPrim::Paren(e) => eval_prepared_with_captures(e, line, captures),
-        PreparedPrim::Literal { regex } => {
-            // L2 实际校验字面量（Not(Literal) 取反依赖此语义）
-            if regex.is_match(line) {
+        PreparedPrim::Literal { regex, l1_verified } => {
+            // v0.49 Opt A：L1 已构造性保证存在的字面量（verified_literals 成员）
+            // 豁免重校验（Rust 方案 §7.9）。Not 内同串节点语义一致：行必含该
+            // 子串 ⇒ Not(verified literal) 恒 False，与跑 regex 结果相同。
+            if *l1_verified {
+                EvalResult::True
+            } else if regex.is_match(line) {
+                // L2 实际校验字面量（Not(Literal) 取反依赖此语义）
                 EvalResult::True
             } else {
                 EvalResult::False
@@ -214,9 +219,12 @@ pub(crate) fn eval_prepared_prim_with_ctx_and_captures(
         PreparedPrim::Paren(e) => {
             eval_prepared_with_ctx_and_captures(e, line, line_no, ctx, captures)
         }
-        PreparedPrim::Literal { regex } => {
-            // L2 实际校验字面量（Not(Literal) 取反依赖此语义）
-            if regex.is_match(line) {
+        PreparedPrim::Literal { regex, l1_verified } => {
+            // v0.49 Opt A（l3 镜像，与 eval_prepared_prim_with_captures 保持一致，§6.5.3）
+            if *l1_verified {
+                EvalResult::True
+            } else if regex.is_match(line) {
+                // L2 实际校验字面量（Not(Literal) 取反依赖此语义）
                 EvalResult::True
             } else {
                 EvalResult::False
@@ -338,7 +346,7 @@ mod tests {
     fn test_capture_extracts_full_match_no_group() {
         // capture(trace_id, /req-\d+/) 无子组 → full match
         let q = parse_query(r#"capture(trace_id, /req-\d+/)"#).unwrap();
-        let prepared = crate::mode::prepared::prepare_expr(&q.expr).unwrap();
+        let prepared = crate::mode::prepared::prepare_expr(&q.expr, &[]).unwrap();
         let line = b"ERROR req-12345 timeout";
         let mut captures = CaptureMap::new();
         let result = eval_prepared_with_captures(&prepared, line, &mut captures);
@@ -355,7 +363,7 @@ mod tests {
     fn test_capture_extracts_group_1_when_present() {
         // capture(tid, /req=(\d+)/) 有子组 → group 1
         let q = parse_query(r#"capture(tid, /req=(\d+)/)"#).unwrap();
-        let prepared = crate::mode::prepared::prepare_expr(&q.expr).unwrap();
+        let prepared = crate::mode::prepared::prepare_expr(&q.expr, &[]).unwrap();
         let line = b"req=12345 done";
         let mut captures = CaptureMap::new();
         let result = eval_prepared_with_captures(&prepared, line, &mut captures);
@@ -371,7 +379,7 @@ mod tests {
     #[test]
     fn test_capture_no_match_returns_false_empty_captures() {
         let q = parse_query(r#"capture(tid, /req=\d+/)"#).unwrap();
-        let prepared = crate::mode::prepared::prepare_expr(&q.expr).unwrap();
+        let prepared = crate::mode::prepared::prepare_expr(&q.expr, &[]).unwrap();
         let line = b"no match here";
         let mut captures = CaptureMap::new();
         let result = eval_prepared_with_captures(&prepared, line, &mut captures);
@@ -383,7 +391,7 @@ mod tests {
     fn test_capture_in_and_expression_both_match() {
         // "ERROR" && capture(tid, /req-\d+/)
         let q = parse_query(r#""ERROR" && capture(tid, /req-\d+/)"#).unwrap();
-        let prepared = crate::mode::prepared::prepare_expr(&q.expr).unwrap();
+        let prepared = crate::mode::prepared::prepare_expr(&q.expr, &[]).unwrap();
         let line = b"ERROR req-99999 timeout";
         let mut captures = CaptureMap::new();
         let result = eval_prepared_with_captures(&prepared, line, &mut captures);
@@ -401,7 +409,7 @@ mod tests {
         // capture(tid, /req-\d+/) && cost_ms>999 — 右侧谓词不命中 → 短路，但 captures 已提取
         // 注：And 短路方向是 left→right，左侧 capture 先执行（提取），右侧失败 → False
         let q = parse_query(r#"capture(tid, /req-\d+/) && cost_ms>999"#).unwrap();
-        let prepared = crate::mode::prepared::prepare_expr(&q.expr).unwrap();
+        let prepared = crate::mode::prepared::prepare_expr(&q.expr, &[]).unwrap();
         let line = b"req-99999 cost_ms=100";
         let mut captures = CaptureMap::new();
         let result = eval_prepared_with_captures(&prepared, line, &mut captures);
@@ -422,7 +430,7 @@ mod tests {
         // capture 提取的值应供同字段谓词使用（行内无 X= 字段）
         // pipeline where 路径与 L2 && 路径需同构
         let q = parse_query(r#"capture(rid, /req-(\d+)/) && rid>10000"#).unwrap();
-        let prepared = crate::mode::prepared::prepare_expr(&q.expr).unwrap();
+        let prepared = crate::mode::prepared::prepare_expr(&q.expr, &[]).unwrap();
         let line = b"req-12345";
         let mut captures = CaptureMap::new();
         let result = eval_prepared_with_captures(&prepared, line, &mut captures);
@@ -439,7 +447,7 @@ mod tests {
     fn test_capture_and_predicate_same_field_in_list() {
         // capture(X) && X in [...] 同字段 in 谓词
         let q = parse_query(r#"capture(rid, /req-(\d+)/) && rid in [12345, 99999]"#).unwrap();
-        let prepared = crate::mode::prepared::prepare_expr(&q.expr).unwrap();
+        let prepared = crate::mode::prepared::prepare_expr(&q.expr, &[]).unwrap();
         let line = b"req-12345";
         let mut captures = CaptureMap::new();
         let result = eval_prepared_with_captures(&prepared, line, &mut captures);
@@ -454,7 +462,7 @@ mod tests {
     fn test_capture_and_predicate_same_field_exists() {
         // capture(X) && X exists 同字段 exists 谓词
         let q = parse_query(r#"capture(rid, /req-(\d+)/) && rid exists"#).unwrap();
-        let prepared = crate::mode::prepared::prepare_expr(&q.expr).unwrap();
+        let prepared = crate::mode::prepared::prepare_expr(&q.expr, &[]).unwrap();
         let line = b"req-12345";
         let mut captures = CaptureMap::new();
         let result = eval_prepared_with_captures(&prepared, line, &mut captures);
@@ -469,7 +477,7 @@ mod tests {
     fn test_capture_and_predicate_same_field_between() {
         // capture(X) && X between A and B 同字段 between 谓词
         let q = parse_query(r#"capture(rid, /req-(\d+)/) && rid between 100 and 99999"#).unwrap();
-        let prepared = crate::mode::prepared::prepare_expr(&q.expr).unwrap();
+        let prepared = crate::mode::prepared::prepare_expr(&q.expr, &[]).unwrap();
         let line = b"req-12345";
         let mut captures = CaptureMap::new();
         let result = eval_prepared_with_captures(&prepared, line, &mut captures);
@@ -493,7 +501,7 @@ mod tests {
         // 67890 > 50000 → True → Not → False → 整体 And False（应被排除）
         // 12345 ≤ 50000 → False → Not → True → 整体 And True（应命中）
         let q = parse_query(r#"capture(rid, /req-(\d+)/) && !(rid>50000)"#).unwrap();
-        let prepared = crate::mode::prepared::prepare_expr(&q.expr).unwrap();
+        let prepared = crate::mode::prepared::prepare_expr(&q.expr, &[]).unwrap();
 
         // rid=12345 ≤ 50000：Not(False) = True → And True
         let mut captures = CaptureMap::new();
@@ -516,7 +524,7 @@ mod tests {
     fn test_capture_and_not_predicate_in_list() {
         // capture(X) && !(X in [A, B]) — Not(in) 组合
         let q = parse_query(r#"capture(rid, /req-(\d+)/) && !(rid in [12345, 99999])"#).unwrap();
-        let prepared = crate::mode::prepared::prepare_expr(&q.expr).unwrap();
+        let prepared = crate::mode::prepared::prepare_expr(&q.expr, &[]).unwrap();
 
         // rid=12345 in [12345,99999]：True → Not → False → And False
         let mut captures = CaptureMap::new();
@@ -534,7 +542,7 @@ mod tests {
         // capture(X) && !(X between A and B) — Not(between) 组合
         let q =
             parse_query(r#"capture(rid, /req-(\d+)/) && !(rid between 10000 and 50000)"#).unwrap();
-        let prepared = crate::mode::prepared::prepare_expr(&q.expr).unwrap();
+        let prepared = crate::mode::prepared::prepare_expr(&q.expr, &[]).unwrap();
 
         // rid=12345 in [10000,50000]：True → Not → False → And False
         let mut captures = CaptureMap::new();
@@ -551,7 +559,7 @@ mod tests {
     fn test_capture_in_or_expression_extracts_from_matching_branch() {
         // capture(a, /x\d+/) || capture(b, /y\d+/)
         let q = parse_query(r#"capture(a, /x\d+/) || capture(b, /y\d+/)"#).unwrap();
-        let prepared = crate::mode::prepared::prepare_expr(&q.expr).unwrap();
+        let prepared = crate::mode::prepared::prepare_expr(&q.expr, &[]).unwrap();
 
         // 左分支命中
         let mut captures = CaptureMap::new();
@@ -589,7 +597,7 @@ mod tests {
         // 这是历史 bug：capture(rid) && !(rid>50000) 中 Not 内部谓词
         // 找不到 rid → NotNumeric → Not=True → 所有行命中）。
         let q = parse_query(r#"!(capture(tid, /req-\d+/))"#).unwrap();
-        let prepared = crate::mode::prepared::prepare_expr(&q.expr).unwrap();
+        let prepared = crate::mode::prepared::prepare_expr(&q.expr, &[]).unwrap();
         let line = b"req-12345";
         let mut captures = CaptureMap::new();
         let result = eval_prepared_with_captures(&prepared, line, &mut captures);

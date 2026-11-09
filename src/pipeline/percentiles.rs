@@ -220,9 +220,9 @@ mod tests {
         // _match = L1 命中字节，非数值 → parse_numeric_value 拒绝 → N/A
         // 验证 pseudo_field_value 路径接通（虽非数值仍走该路径，但被 parse 拒绝）
         let mut m1 = MatchedLine::new(1, b"ERROR foo");
-        m1.match_bytes = Some(b"ERROR".to_vec());
+        m1.match_bytes = Some(std::sync::Arc::from(b"ERROR".as_ref()));
         let mut m2 = MatchedLine::new(2, b"ERROR bar");
-        m2.match_bytes = Some(b"ERROR".to_vec());
+        m2.match_bytes = Some(std::sync::Arc::from(b"ERROR".as_ref()));
         let out = apply_percentiles(&[m1, m2], b"_match", &[50.0]);
         assert!(out.contains("N/A"), "_match 非数值应输出 N/A, 实际: {out}");
     }
@@ -239,9 +239,9 @@ mod tests {
     fn test_percentiles_file_pseudo_field_skipped_as_non_numeric() {
         // _file = 文件路径，非数值 → 跳过
         let mut m1 = MatchedLine::new(1, b"x");
-        m1.path = Some("src/a.rs".to_string());
+        m1.path = Some(std::sync::Arc::from("src/a.rs"));
         let mut m2 = MatchedLine::new(2, b"x");
-        m2.path = Some("src/b.rs".to_string());
+        m2.path = Some(std::sync::Arc::from("src/b.rs"));
         let out = apply_percentiles(&[m1, m2], b"_file", &[50.0]);
         assert!(out.contains("N/A"), "_file 非数值应输出 N/A, 实际: {out}");
     }

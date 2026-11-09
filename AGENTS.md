@@ -130,7 +130,7 @@ gxp/
 
 ### 3.2 文档增长约束
 
-- **AGENTS.md ≤ 330 行**：版本历史移至 `docs/changelog.md`（不在本文件保留版本行）。行数上限 2026-11-01 从 320 放到 330，理由：§6.5.2-6.5.3 自举组合+同构镜像检查项随 bug 修复积累，是防回归机制核心约束不可下沉
+- **AGENTS.md ≤ 340 行**：版本历史移至 `docs/changelog.md`（不在本文件保留版本行）。行数上限 2026-11-01 从 320 放到 330、2026-11-09 从 330 放到 340，理由：§6.5.2-6.5.3 自举组合+同构镜像检查项随 bug 修复积累，是防回归机制核心约束不可下沉
 - **Rust 方案 ≤ 1500 行**：版本历史引用 `docs/changelog.md`，不重复
 
 ## 4. 代码规范
@@ -255,8 +255,9 @@ gxp/
 | capture × 同字段谓词（v0.44 新增，B8 暴露） | `gxp '"capture" && ">" \|\| "capture" && " in " \|\| "capture" && " between " \|\| "capture" && " exists"' tests/` | ≥1 e2e 命中每类 |
 | capture × Not(同字段谓词)（v0.44 新增，B9 暴露） | `gxp '"capture" && "!"' tests/` | ≥1 e2e 命中 |
 | JSON 格式 × 字段值类型 × 首尾空白（v0.44 新增，B10/B11） | `gxp '"exists" && "json"' tests/`（含尾随空格/CRLF/行首空格变体） | ≥1 e2e 命中 |
+| 字符串等值 × capture/伪字段/Not（v0.48 新增，B15 暴露） | `gxp '/="ERROR/ && ("capture" \|\| "_tag" \|\| "!")' tests/` | ≥1 e2e 命中每类（capture/_tag/!） |
 
-不达 → 立即补 e2e（参照 v0.43 commit 80b339c），视为不变式违反（§5.3）。
+不达 → 立即补 e2e（参照 changelog v0.43 防回归机制），视为不变式违反（§5.3）。
 
 #### 6.5.3 bug 修复后同构镜像扫描（v0.44 新增）
 
@@ -264,9 +265,9 @@ gxp/
 
 | 镜像对 | 自举命令（在 `src/` 上跑） | 检查要点 |
 |---|---|---|
-| `eval_prepared_with_captures` vs `eval_prepared_with_ctx_and_captures`（l3 镜像） | `gxp 'eval_prepared_with_captures' src/ --verify` | Not/Capture/Compare 分支一致 |
-| `execute_stages` vs `_streaming` vs `_directory`（三路径镜像） | `gxp 'execute_stages' src/ --verify` | m.path 填充 / captures 传递一致 |
-| `run_gxp_mode` vs `_streaming` vs `_with_content` | `gxp 'run_gxp_mode' src/ --verify` | m.path 填充 / json vs 文本分支一致 |
+| `eval_prepared_with_captures` vs `eval_prepared_with_ctx_and_captures`（l3 镜像） | `gxp '"eval_prepared_with_captures"' src/ --verify` | Not/Capture/Compare 分支一致 |
+| `execute_stages` vs `_streaming` vs `_directory`（三路径镜像） | `gxp '"execute_stages"' src/ --verify` | m.path 填充 / captures 传递一致 |
+| `run_gxp_mode` vs `_streaming` vs `_with_content` | `gxp '"run_gxp_mode"' src/ --verify` | m.path 填充 / json vs 文本分支一致 |
 
 不达 → 视为遗漏（§5.3 立即修复）。
 
@@ -285,17 +286,17 @@ gxp/
 
 ## 7. 性能与资源约束
 
-### 7.1 性能目标
+### 7.1 性能基线锚点（回归性门禁，v0.49 重锚定）
 
-| 指标 | 目标 |
+| 指标 | 基线锚点（本机 i7-10700） |
 |---|---|
-| L1 两遍链 | 30ms |
-| L2 字段抽取（31931 行） | 20ms |
-| 全查询 + Top20（44MB） | 80ms |
+| L1 两遍链 | 33.51ms（v0.49 diag median） |
+| L2 字段抽取（31931 行） | 8.21ms（v0.47 criterion，v0.49 未复测） |
+| 全查询 + Top20（44MB） | 106.74ms（v0.49 diag median of 3） |
 | `sample N`（44MB，N=20..10000） | <1ms 洗牌开销 |
 | DirIndex lax 二次（Linux） | 0.15ms |
 
-> 实测数据详见 `docs/performance-baseline.md` §1.1（44MB）+ §1.3（12GB 大数据多轮）。Windows `FindFirstFile` 单次 ~60µs（Linux 5-10×），物理上不可能达 0.15ms。Linux 接入按 CI 节奏推进，不门控。vs GNU grep 对比数据见 perf-baseline §1.3.2（911MB 单文件 gxp 2.42× 快于 GNU grep 3.0）。详见 Rust 方案 §11.5.4。
+> **门禁口径（v0.49 重锚定，2026-11-09 用户确认）**：后续版本同机 A/B 实测（diag median of 3），median 劣化 >10% 需归因；跨机绝对值不可比（比值 1.52-1.85×）。旧机 80/30/20ms 目标（i7-14700，v0.32-v0.45）降为历史参考（perf-baseline §1.1 机器变更说明）。实测数据权威源 `docs/performance-baseline.md` §1.1-1.2（44MB）+ §1.3（12GB 大数据多轮）。Windows `FindFirstFile` 单次 ~60µs（Linux 5-10×），物理上不可能达 0.15ms。Linux 接入按 CI 节奏推进，不门控。vs GNU grep 对比数据见 perf-baseline §1.3.2（911MB 单文件 gxp 2.42× 快于 GNU grep 3.0）。详见 Rust 方案 §11.5.4。
 
 **内存/依赖**：零持久索引（D10 + 统一 `read_to_end` + thread-local buffer 复用）；不引入新 crate（Rust 方案 §13 列出）；不 fork；license MIT OR Apache-2.0
 
@@ -321,7 +322,8 @@ gxp/
 > - **v0.36 B1-B3**：终止 stage fail-loud / group by captures 优先 / 文档改"count group by"→"group by"。
 > - **v0.43 B1'-B3'**：apply_where 漏 captures 优先 / percentiles 未走 pseudo_field_value / where 多 token 谓词解析断裂。
 > - **v0.44 B6-B11**：单文件/流式漏填 m.path / capture 同字段谓词 L1 误淘汰 + Not 漏传 captures（同构遗漏 2 次）/ find_value 漏 JSON line + prefix_variants 缺变体 / detect_format 不 trim 空白。6 bug 均不靠 §6.5.2 发现，矩阵规则已补齐（§6.5.2 +3 行 + §6.5.3 镜像扫描 + §6.6 强制 e2e，详见 changelog v0.44）。
-> - **v0.45 B12**：扩展名过滤遗漏 `.jsx`——`lang_matches_ext` Tsx/JavaScript 都没加 `.jsx`，导致 `ast(tsx/js)` 对 `.jsx` 文件返回 0 行（v0.44 能正常解析）。修复：Tsx 和 JavaScript 都加 `.jsx`。
+> - **v0.45-v0.47 B12-B14**：B12 扩展名过滤遗漏 `.jsx`；B13 `trace rust` 漏抓新 panic 格式；**B14 无括号混合 `&&`/`||` 与 Regex 组合 L1 部分组误杀 + 捷径 match-all（不变式违反，`--verify` 不可发现——暴力与优化共用 L1 同错对齐；修复：Or 组完整性 + `l1_exact` 捷径门槛，详见 changelog v0.47）**。
+> - **v0.48 B15**：Or 分支内字段谓词的前缀被当必选粗筛（`level in [ERROR] \|\| "plain"` 丢 plain-only 行，`L1 ⊇ L2` 违反，`--verify` 报暴力独有）——修复：Or 子树前缀豁免（与 Not 豁免同构；B14 只审字面量组完整性未审前缀收集）。发现方式：字符串等值 e2e 独立期望集首跑暴露（B14 教训的直接回报），详见 changelog v0.48。
 
 ---
 

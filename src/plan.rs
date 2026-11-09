@@ -329,7 +329,9 @@ impl ExecutionPlan {
         let mut out = String::new();
         out.push_str("L1 必选组（组间 AND）:\n");
         if self.required_groups.is_empty() {
-            out.push_str("  (无字面量约束——纯字段谓词或 .* 查询)\n");
+            out.push_str(
+                "  (无字面量约束——纯字段谓词 / .* / Or 混合非字面量分支 [Regex/And/Not，B14])\n",
+            );
         } else {
             for (i, g) in self.required_groups.iter().enumerate() {
                 let lits: Vec<String> = g.literals.iter().map(|s| format!("{s:?}")).collect();

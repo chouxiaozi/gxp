@@ -19,7 +19,7 @@
 //! | python | `^  File ".*", line \d+` 或 `^    \S` | 末行 `^[A-Za-z]\w*Error: ` 或下一非缩进行 |
 //! | java | `^\s+at\s` | `^Caused by:` 子段开始或下一行非 `^\s+at\s` |
 //! | js | `^\s+at\s` | 下一 `^Error:` 或下一非 `^\s+at\s` |
-//! | rust | `^\s+(note:|stack backtrace:|\d+:)` | 下一非 `^\s+` 行 |
+//! | rust | 新格式（≥1.65）头行尾 `:` 后紧跟 1 行顶格消息行；`note:` / `stack backtrace:` 顶格；`^\s+\d+:` 帧；`^\s+at ` 帧内位置行 | 下一非续行 |
 //! | go | `^(goroutine \d+ \[running:\]|\s+\S+\.go:\d+)` | 下一 `^panic:` 或下一非续行 |
 //! | csharp | `^\s+at\s` | `^--- End of inner exception` 或下一非 `^\s+at\s` |
 //!
@@ -140,6 +140,13 @@ fn collect_extra_lines(
     let mut idx = hit_line_no + 1; // 1-based，下一行
                                    // Go 状态机：遇到 goroutine [running]: 头后宽松接收，到空行或非 stack 形态终止
     let mut go_in_stack = false;
+    // Rust 新格式（≥1.65）状态机：头行 `panicked at <loc>:` 以 `:` 结尾，
+    // 错误消息在下一行顶格（任意文本，无法无状态识别）→ 仅头行后紧跟的 1 行无条件接收
+    let mut rust_msg_pending = false;
+    if lang == "rust" {
+        let (s, e) = line_offsets[hit_line_no - 1];
+        rust_msg_pending = is_new_format_panic_header(&content[s..e]);
+    }
     while idx <= total_lines {
         let (s, e) = line_offsets[idx - 1];
         let line = &content[s..e];
@@ -175,6 +182,13 @@ fn collect_extra_lines(
             extras.push(Arc::from(line));
             idx += 1;
         } else {
+            // Rust 新格式消息行：头行后紧跟的 1 行任意顶格文本（一次性）
+            if rust_msg_pending {
+                rust_msg_pending = false;
+                extras.push(Arc::from(line));
+                idx += 1;
+                continue;
+            }
             if !is_continuation(line, lang) {
                 break;
             }
@@ -276,18 +290,22 @@ fn is_js_continuation(line: &[u8]) -> bool {
     is_java_continuation(line)
 }
 
-/// Rust 续行：`note: run with...` / `stack backtrace:` / `^\s+\d+:`（Rust panic 形态）
-///
-/// Rust panic 输出特征：
-/// - `note:` 行通常顶格不缩进（首字节即 `n`）
-/// - `stack backtrace:` 也是顶格
-/// - 后续帧 `   0: std::panicking::begin_panic` 是缩进 + 数字 + 冒号
+/// Rust 续行（两种 panic 格式）：
+/// - 顶格 `note:` / `stack backtrace:`
+/// - 帧 `^\s+\d+:`（`   0: std::panicking::begin_panic`）
+/// - 帧内位置行 `^\s+at `（`             at ./src/foo.rs:10:5`，帧与帧之间，与 Java/JS 同形态）
+/// - 新格式（≥1.65）消息行不在此判定——任意顶格文本无法无状态识别，
+///   由 `collect_extra_lines` 的 `rust_msg_pending` 状态一次性接收
 fn is_rust_continuation(line: &[u8]) -> bool {
     if line.is_empty() {
         return false;
     }
     // 顶格关键字（不缩进）
     if line.starts_with(b"note:") || line.starts_with(b"stack backtrace:") {
+        return true;
+    }
+    // 帧内位置行（缩进 + at，两格式回溯中均出现）
+    if is_java_continuation(line) {
         return true;
     }
     // 缩进 + 数字+:（栈帧编号）
@@ -301,6 +319,16 @@ fn is_rust_continuation(line: &[u8]) -> bool {
         .copied()
         .collect();
     starts_with_number_colon(&trimmed)
+}
+
+/// Rust 新格式（≥1.65）panic 头行判定：`thread '<name>' panicked at <loc>:` 行尾是 `:`。
+///
+/// 旧格式消息在头行内（`panicked at 'msg', src/main.rs:42:3`），行尾是列号数字；
+/// 新格式错误消息移到下一行顶格。以行尾是否 `:` 区分（trim_end 兼容 CRLF）。
+fn is_new_format_panic_header(hit_line: &[u8]) -> bool {
+    let s = String::from_utf8_lossy(hit_line);
+    let t = s.trim_end();
+    t.starts_with("thread ") && t.contains("panicked at") && t.ends_with(':')
 }
 
 /// 判断字节串是否以 `数字+:` 开头（如 `0:`、`1:`、`42:`）
@@ -495,6 +523,78 @@ next non-trace line";
     }
 
     #[test]
+    fn test_new_format_panic_header_discriminates() {
+        // 新格式：行尾 `:`（位置后无消息）
+        assert!(is_new_format_panic_header(
+            b"thread 'main' panicked at src/main.rs:42:18:"
+        ));
+        // CRLF：trim_end 兼容
+        assert!(is_new_format_panic_header(
+            b"thread 'worker-1' panicked at src/lib.rs:7:5:\r"
+        ));
+        // 旧格式：消息在头行内，行尾是列号数字 → false
+        assert!(!is_new_format_panic_header(
+            b"thread 'main' panicked at 'x', src/main.rs:42:3"
+        ));
+        // 非 panic 头行 → false
+        assert!(!is_new_format_panic_header(b"note: something:"));
+    }
+
+    #[test]
+    fn test_apply_trace_rust_new_format_message_then_note() {
+        // B13：新格式（≥1.65）消息行顶格，后跟 note:（RUST_BACKTRACE 未设）
+        let content = b"\
+thread 'main' panicked at src/main.rs:42:18:
+called `Result::unwrap()` on an `Err` value: ParseError
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+2026-11-09T10:00:08.000Z INFO [api] msg=after_panic";
+        let m = make_line(1, "thread 'main' panicked at src/main.rs:42:18:");
+        let out = apply_trace(&[m], content, Some("rust"));
+        // 消息行（msg 槽位）+ note: = 2 个续行；正常日志行终止
+        assert_eq!(out[0].extra_lines.len(), 2, "{:?}", out[0].extra_lines);
+        assert!(out[0].extra_lines[0].starts_with(b"called `Result::unwrap()`"));
+        assert!(out[0].extra_lines[1].starts_with(b"note:"));
+    }
+
+    #[test]
+    fn test_apply_trace_rust_new_format_backtrace_with_at_lines() {
+        // B13 同族：真实回溯帧间 `at` 位置行（RUST_BACKTRACE=1 形态）
+        let content = b"\
+thread 'main' panicked at src/main.rs:42:18:
+called `Result::unwrap()` on an `Err` value: ParseError
+stack backtrace:
+   0: gxp::l2::extract::find_value
+             at ./src/l2/extract.rs:88:24
+   1: gxp::mode::eval::eval_prepared
+             at ./src/mode/eval.rs:210:9
+next non-trace line";
+        let m = make_line(1, "thread 'main' panicked at src/main.rs:42:18:");
+        let out = apply_trace(&[m], content, Some("rust"));
+        // 消息 1 + stack backtrace: 1 + 帧 2 + at 2 = 6 个续行
+        assert_eq!(out[0].extra_lines.len(), 6, "{:?}", out[0].extra_lines);
+        assert!(!out[0]
+            .extra_lines
+            .iter()
+            .any(|l| l.starts_with(b"next non-trace")));
+    }
+
+    #[test]
+    fn test_apply_trace_rust_old_format_backtrace_with_at_lines() {
+        // 旧格式 + 帧间 at 行（at 规则两格式通用）
+        let content = b"\
+thread 'main' panicked at 'x', src/main.rs:42:3
+stack backtrace:
+   0: std::panicking::begin_panic
+             at /rustc/abc/library/std/src/panicking.rs:662:3
+   1: main::main
+next non-trace line";
+        let m = make_line(1, "thread 'main' panicked at 'x', src/main.rs:42:3");
+        let out = apply_trace(&[m], content, Some("rust"));
+        // stack backtrace: + 帧 2 + at 1 = 4 个续行（at 行后帧继续收）
+        assert_eq!(out[0].extra_lines.len(), 4, "{:?}", out[0].extra_lines);
+    }
+
+    #[test]
     fn test_apply_trace_go_collects_goroutine_frame() {
         let content = b"\
 panic: runtime error: index out of range
@@ -586,8 +686,8 @@ next line";
             map.insert("trace_id".to_string(), b"req-123".to_vec());
             map
         });
-        m.path = Some("app.log".to_string());
-        m.match_bytes = Some(b"panic".to_vec());
+        m.path = Some(std::sync::Arc::from("app.log"));
+        m.match_bytes = Some(std::sync::Arc::from(b"panic".as_ref()));
         let out = apply_trace(&[m], content, Some("go"));
         assert_eq!(out[0].captures.get("trace_id"), Some(&b"req-123".to_vec()));
         assert_eq!(out[0].path.as_deref(), Some("app.log"));

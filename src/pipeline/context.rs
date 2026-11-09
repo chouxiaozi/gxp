@@ -44,11 +44,15 @@ pub fn apply_context(
         .filter(|m| !m.captures.is_empty())
         .map(|m| (m.line_no, m.captures.clone()))
         .collect();
-    let hit_match_bytes: std::collections::HashMap<usize, Vec<u8>> = matched
+    let hit_match_bytes: std::collections::HashMap<usize, std::sync::Arc<[u8]>> = matched
         .iter()
-        .filter_map(|m| m.match_bytes.as_ref().map(|mb| (m.line_no, mb.clone())))
+        .filter_map(|m| {
+            m.match_bytes
+                .as_ref()
+                .map(|mb| (m.line_no, std::sync::Arc::clone(mb)))
+        })
         .collect();
-    let hit_path: Option<String> = matched.iter().find_map(|m| m.path.clone());
+    let hit_path: Option<std::sync::Arc<str>> = matched.iter().find_map(|m| m.path.clone());
 
     // 收集所有窗口内的行号（可能重复）
     let mut line_nos: Vec<usize> = Vec::new();
@@ -105,8 +109,8 @@ pub fn apply_context_streaming(
     // 同时记录命中行的 captures（用于保留 capture 字段）
     let mut hit_captures: std::collections::HashMap<usize, crate::pipeline::CaptureMap> =
         std::collections::HashMap::new();
-    let hit_path: Option<String> = matched.iter().find_map(|m| m.path.clone());
-    let mut hit_match_bytes: std::collections::HashMap<usize, Vec<u8>> =
+    let hit_path: Option<std::sync::Arc<str>> = matched.iter().find_map(|m| m.path.clone());
+    let mut hit_match_bytes: std::collections::HashMap<usize, std::sync::Arc<[u8]>> =
         std::collections::HashMap::new();
     for m in matched {
         let lo = m.line_no.saturating_sub(before).max(1);
@@ -321,7 +325,7 @@ mod tests {
         let content = b"l1\nl2\nl3\nl4\nl5\n";
         let mut m = matched(&[3], content);
         for ml in &mut m {
-            ml.path = Some("app.log".to_string());
+            ml.path = Some(std::sync::Arc::from("app.log"));
         }
         let out = apply_context(&m, content, 1, 1);
         // 所有行（含 context 扩展行）应继承命中行 path
@@ -329,7 +333,7 @@ mod tests {
         for ml in &out {
             assert_eq!(
                 ml.path,
-                Some("app.log".to_string()),
+                Some(std::sync::Arc::from("app.log")),
                 "每行应继承 path: line_no={}",
                 ml.line_no
             );
@@ -340,22 +344,22 @@ mod tests {
     fn test_context_inherits_path_and_captures_on_hit() {
         let content = b"l1\nl2\nl3\n";
         let mut m = matched(&[2], content);
-        m[0].path = Some("app.log".to_string());
+        m[0].path = Some(std::sync::Arc::from("app.log"));
         m[0].captures.insert("uid".to_string(), b"abc".to_vec());
-        m[0].match_bytes = Some(b"l2".to_vec());
+        m[0].match_bytes = Some(std::sync::Arc::from(b"l2".as_ref()));
         let out = apply_context(&m, content, 1, 0);
         // 行 1,2 共 2 行
         assert_eq!(out.len(), 2);
         // 命中行 2 应保留 captures + match_bytes + path
         assert!(out[1].captures.contains_key("uid"), "命中行应保留 captures");
         assert!(out[1].match_bytes.is_some(), "命中行应保留 match_bytes");
-        assert_eq!(out[1].path, Some("app.log".to_string()));
+        assert_eq!(out[1].path, Some(std::sync::Arc::from("app.log")));
         // 非命中行 1 应继承 path，但 captures 和 match_bytes 不继承
         assert!(out[0].captures.is_empty(), "非命中行不应有 captures");
         assert!(out[0].match_bytes.is_none(), "非命中行不应有 match_bytes");
         assert_eq!(
             out[0].path,
-            Some("app.log".to_string()),
+            Some(std::sync::Arc::from("app.log")),
             "非命中行应继承 path"
         );
     }
@@ -366,14 +370,14 @@ mod tests {
         let path = write_temp(content);
         let mut m = matched(&[3], content);
         for ml in &mut m {
-            ml.path = Some("app.log".to_string());
+            ml.path = Some(std::sync::Arc::from("app.log"));
         }
         let out = apply_context_streaming(&m, &path, 1, 1).expect("流式 context 应成功");
         assert_eq!(out.len(), 3, "行 2,3,4 共 3 行");
         for ml in &out {
             assert_eq!(
                 ml.path,
-                Some("app.log".to_string()),
+                Some(std::sync::Arc::from("app.log")),
                 "每行应继承 path: line_no={}",
                 ml.line_no
             );

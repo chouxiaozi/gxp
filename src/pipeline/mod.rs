@@ -61,12 +61,17 @@ pub struct MatchedLine {
     /// capture 提取的字段值（字段注入）。
     pub captures: CaptureMap,
     /// 文件路径（目录模式填充，供 JSON 输出 + 非 JSON 路径前缀）。
-    pub path: Option<String>,
+    /// `Arc<str>`（v0.49 Opt C）：单文件/目录模式所有命中行共享同一路径，
+    /// clone 从每行堆分配 String 变引用计数（103607 行 × ~40ns → ~0.3ms，
+    /// 原实测增量 ~6.5ms，Rust 方案 §7.9）。
+    pub path: Option<Arc<str>>,
     /// L1 匹配的字节范围内容（伪字段 `_match` 使用）。
     /// BARE 模式：正则 `find` 的匹配字节。
     /// gxp 模式：第一个必选组第一个命中的字面量（aho-corasick find）。
     /// 无字面量组（纯字段谓词）或 BARE 无 match 时为 None。
-    pub match_bytes: Option<Vec<u8>>,
+    /// `Arc<[u8]>`（v0.49 Opt B）：字面量是编译期常量，clone 引用计数化
+    /// （原每行 Vec 分配 ~3.6ms，Rust 方案 §7.9）。
+    pub match_bytes: Option<Arc<[u8]>>,
     /// 多行 stack trace 的后续行（由 `trace` 动词填充）。
     /// 默认空 Vec——非 trace 路径无开销。
     pub extra_lines: Vec<Arc<[u8]>>,
@@ -127,9 +132,13 @@ pub fn execute_stages<W: Write>(
     // （`: N` 或只保留首行），跨输入源契约违反（§6.4 第 3 条 + 第 1 条）。
     // 文本输出由 `emit_remaining` 的 `show_path_prefix = false` 抑制路径前缀。
     let mut lines = matched;
-    for m in &mut lines {
-        if m.path.is_none() {
-            m.path = Some(file_path.to_string());
+    if !lines.is_empty() {
+        // Opt C：一次构造 Arc，逐行 refcount clone（原每行 String 堆分配）
+        let shared_path: Arc<str> = Arc::from(file_path);
+        for m in &mut lines {
+            if m.path.is_none() {
+                m.path = Some(Arc::clone(&shared_path));
+            }
         }
     }
     let mut emitted = false;
@@ -352,10 +361,13 @@ pub fn execute_stages_directory<W: Write>(
         let hit_count = matched.len();
         file_match_counts.push((path.clone(), hit_count));
 
+        // Opt C：每文件一次 Arc 构造，行级 clone 引用计数化
+        let path_arc: Arc<str> = Arc::from(path.as_str());
+
         // 给每行填充 path（目录模式特有）
         let mut matched = matched;
         for m in &mut matched {
-            m.path = Some(path.clone());
+            m.path = Some(Arc::clone(&path_arc));
         }
 
         // content 为空 → 流式文件：context/trace 均不支持流式（trace 流式 fail-loud 在外层）
@@ -369,7 +381,7 @@ pub fn execute_stages_directory<W: Write>(
         // context 扩展行继承命中行 path（同文件内 context 行 path 相同）
         for m in &mut lines {
             if m.path.is_none() {
-                m.path = Some(path.clone());
+                m.path = Some(Arc::clone(&path_arc));
             }
         }
         // trace 在每文件独立执行（跨文件不连续，参照 context 跨文件规则）
@@ -680,7 +692,8 @@ fn normalize_path(p: &str) -> String {
 /// **DRY**：消除 `project.rs`/`sort.rs`/`rank.rs` 三处伪字段分支复制。
 pub(crate) fn pseudo_field_value(m: &MatchedLine, name: &[u8]) -> Option<Vec<u8>> {
     if name == b"_match" {
-        return m.match_bytes.clone();
+        // match_bytes 已 Arc 化（v0.49 Opt B），此处按接口契约转 owned
+        return m.match_bytes.as_ref().map(|b| b.to_vec());
     }
     if name == b"_line" {
         return Some(m.line.to_vec());
@@ -715,8 +728,14 @@ fn apply_where(lines: Vec<MatchedLine>, expr: &Expr) -> Result<Vec<MatchedLine>>
     let compiled = crate::l1::compiler::compile(expr).map_err(|e| crate::GxpError::Runtime {
         detail: format!("L1 编译失败: {e}"),
     })?;
-    let prepared = crate::mode::prepared::prepare_expr(expr)?;
-    let needs_l2 = crate::mode::detect::has_any_predicate(expr);
+    // where 的 L1 预筛可被 captures 旁路（captures_has_field 时跳过 l1_match），
+    // 同一 prepared 无法对两种路径给不同豁免 → 保守传空集，不豁免（v0.49 Opt A）
+    let prepared = crate::mode::prepared::prepare_expr(expr, &[])?;
+    // B14：where 的 EXPR 同样只在 l1_exact（纯字面量且 L1 组精确编码语义）
+    // 时可走「L1 命中即通过」捷径；Regex / 混合 Or 必须走 L2 全树精判
+    // （原 `!has_any_predicate` 门槛对 `"a" && /re/`、`"a" && "b" || "c"`
+    // 等 where 表达式不健全——正则右支从不检查、And 分支被部分组误杀）。
+    let where_l1_exact = crate::mode::detect::l1_exact(expr);
     // 收集 where EXPR 引用的所有字段名（用于判断 captures 是否已含某字段值，
     // 若含则跳过 L1 前缀粗筛——L1 粗筛只对行内字段有意义）。
     let pred_fields = collect_pred_fields(expr);
@@ -731,7 +750,7 @@ fn apply_where(lines: Vec<MatchedLine>, expr: &Expr) -> Result<Vec<MatchedLine>>
         if !captures_has_field && !compiled.l1_match(&m.line) {
             continue;
         }
-        if !needs_l2 {
+        if where_l1_exact {
             out.push(m);
             continue;
         }
@@ -810,7 +829,7 @@ mod tests {
     #[test]
     fn test_emit_json_includes_path_when_some() {
         let mut m = make_line(1, "ERROR");
-        m.path = Some("src/main.rs".to_string());
+        m.path = Some(std::sync::Arc::from("src/main.rs"));
         let json = emit_json(&[m]);
         assert!(
             json.contains("\"path\":\"src/main.rs\""),
@@ -847,7 +866,7 @@ mod tests {
     #[test]
     fn test_emit_json_includes_match_when_some() {
         let mut m = make_line(1, "ERROR here");
-        m.match_bytes = Some(b"ERROR".to_vec());
+        m.match_bytes = Some(std::sync::Arc::from(b"ERROR".as_ref()));
         let json = emit_json(&[m]);
         assert!(
             json.contains("\"match\":\"ERROR\""),
@@ -878,7 +897,7 @@ mod tests {
     fn test_emit_text_with_path_adds_prefix() {
         // 目录模式 path=Some + show_path_prefix=true → path:行号:行内容
         let mut m = make_line(1, "ERROR");
-        m.path = Some("src/main.rs".to_string());
+        m.path = Some(std::sync::Arc::from("src/main.rs"));
         let text = emit_text_dir(&[m]);
         assert_eq!(text, "src/main.rs:1:ERROR\n");
     }
@@ -887,7 +906,7 @@ mod tests {
     fn test_emit_text_normalizes_backslash_path() {
         // 路径分隔符统一为正斜杠（目录模式）
         let mut m = make_line(1, "ERROR");
-        m.path = Some("src\\pipeline\\mod.rs".to_string());
+        m.path = Some(std::sync::Arc::from("src\\pipeline\\mod.rs"));
         let text = emit_text_dir(&[m]);
         assert_eq!(text, "src/pipeline/mod.rs:1:ERROR\n");
     }

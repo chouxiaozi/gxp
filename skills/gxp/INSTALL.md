@@ -62,7 +62,7 @@ cp dist/skill/bin/gxp.exe ~/AppData/Local/gxp/gxp.exe
 ```bash
 # 探测可用目录（任选其一）
 command -v cargo && dirname "$(command -v cargo)"   # cargo bin（若有 Rust 工具链）
-ls /d/soft/scoop/shims/ 2>&1 | head -5               # scoop shims（若有 scoop）
+ls ~/scoop/shims/ 2>&1 | head -5                     # scoop shims（若有 scoop）
 ```
 
 ### 步骤 2：把目标目录加入 PATH（永久用户级）

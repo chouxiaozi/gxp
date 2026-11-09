@@ -33,7 +33,7 @@ gxp 'Exception | trace csharp' app.log               # 显式 csharp（或 cs / 
 gxp --json 'panic | trace' app.log
 
 # 源码层错误诊断：Rust unwrap() 集中点
-gxp 'ast(rs, "$OBJ.unwrap()")' src/ --features l3-structural
+gxp 'ast(rs, "$OBJ.unwrap()")' src/
 ```
 
 ## B. 性能分析
@@ -66,7 +66,7 @@ gxp '_tag in [checkout,billing] && cost_ms>500 | rank top 10 by cost_ms desc | f
 
 ```bash
 # TypeScript：找所有 useQuery 调用
-gxp 'ast(ts, "useQuery($$$A)")' src/ --features l3-structural
+gxp 'ast(ts, "useQuery($$$A)")' src/
 
 # 单参数 useState 计数
 gxp 'ast(ts, "useState($A)") | count' src/

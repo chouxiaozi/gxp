@@ -177,6 +177,12 @@ capture  := 'capture' '(' NAME ',' REGEX ')'    // capture(trace_id, /req-\d+/)�
                                               // L1 不下推（正则捕获组无字节级字面量可提取），视为可能命中
                                               // 不变式 L1 ⊇ L2：L1 不淘汰任何候选 → 所有行进 L2
 pred     := NAME ('>'|'>='|'<'|'<='|'=='|'!='|'=') VALUE
+                                                    // VALUE 无引号 = 数值字面量（D5 11 维契约，§3.3）
+         | NAME ('=='|'=') STRING                  // v0.48 字符串等值语法糖：level="ERROR" ≡ level in [ERROR]
+                                                    // 消歧：等值操作符 RHS 带双引号 = 字符串等值（脱糖见 §3.2）；
+                                                    // 无引号 = 数值等值（D5 原样）
+                                                    // '!=' 带引号不接受 → fail-loud 提示 !(level="ERROR")
+                                                    //（§3.4 词法规则下 ! 前是字母按字面处理，!= 组合无法成为操作符）
          | NAME 'in' '[' VALUE (',' VALUE)* ']'
          | NAME 'exists'
          | NAME 'between' VALUE 'and' VALUE     // 数值 between：VALUE 是数值字面量（D5 11 维契约）
@@ -217,6 +223,14 @@ gxp 'a|b' app.log                             # ≡ grep -E 'a|b' app.log（ERE 
 # 2. 布尔 + 字段作用域 + 数值域 + Top-K
 gxp '("timeout" || "latency") && _tag in [checkout,billing] && cost_ms>800
      | rank top 20 by cost_ms desc | fields _ts,_tag,cost_ms' app.log
+
+# 2a. 字符串等值（v0.48 语法糖；agent A/B 实验第一摩擦源：3/8 agent 自然写出 level="ERROR" 被拒）
+gxp 'level="ERROR" && cost_ms>800 | rank top 20 by cost_ms desc' app.log
+# ≡ level in [ERROR] && cost_ms>800 ...（编译期脱糖为单元素 in，见 §3.2 字符串等值脱糖）
+gxp 'level=="ERROR"' app.log              # == 同样接受带引号 RHS（等值操作符统一消歧规则）
+gxp '!(level="ERROR")' app.log            # 否定强制括号（D6）；无 level 字段的行也命中（§3.3）
+gxp 'level!="ERROR"' app.log              # ❌ fail-loud：! 前是字母按字面处理（§3.4），!= 无法成为操作符；
+                                          #    报错提示改写为 !(level="ERROR")
 
 # 3. 聚合与可解释执行计划
 gxp '"timeout" && cost_ms>900 | group by _tag' app.log
@@ -379,6 +393,17 @@ L4  rank(BM25 over 候选集) → top-k → fields/json → trace(多行 stack t
 
 **不变式**：OR 内部的谓词一律不下沉（下沉就变 AND，破坏超集不变式）。
 
+#### 字符串等值脱糖（v0.48）
+
+`level="ERROR"` 在解析期脱糖为 `In(level, ["ERROR"])`——单元素 `in`，L1/L2 无新增语义分支：
+
+- **消歧规则**：`=`/`==` 的 RHS 带双引号 = 字符串等值（本节脱糖）；无引号 = 数值等值（D5 原样）。`!=` 带引号不接受（fail-loud 提示 `!(level="ERROR")`——`!=` 组合在 §3.4 词法规则下无法成为操作符）
+- **L1 下推**：与 `in` 完全同构（字段名前缀粗筛 + Or 组完整性 + Not 子树豁免自动适用，见上下两节）
+- **L2 求值**：走 `In` 成员判定（字段值与字面量的字节比较）
+- **定理式等价**：`level="ERROR"` ≡ `level in [ERROR]`——构造性等价（同一 `In` 节点），非语义模拟
+
+STRING RHS 是单一 STRING 记号，允许含空格/逗号/`]` 的值（不受 `in` 列表裸词分隔符限制）；字符集与 prim 的 STRING 字面量一致（§2.2）。
+
 #### L1 不下推场景（维持 `L1 ⊇ L2`）
 
 两类谓词字段**不参与 L1 前缀粗筛**——否则会破坏 `L1 ⊇ L2` 不变式（L1 漏候选，L2 倒希望命中）：
@@ -386,6 +411,8 @@ L4  rank(BM25 over 候选集) → top-k → fields/json → trace(多行 stack t
 1. **Not 子树豁免**：`!(cost_ms>800)` 对无 `cost_ms` 字段的行视为"谓词假→取反为真→命中"（§3.3 字段不存在语义）。若 L1 对 Not 内部的 `cost_ms>800` 下推 `cost_ms=` 前缀粗筛，会淘汰所有无 `cost_ms` 字段的行——而 L2 的 Not 语义恰恰希望命中它们。故 Not 子树完全不收集字段谓词，L1 对 Not 内部不做前缀粗筛，把全部判定交给 L2 `eval_prepared` 递归求值。
 
 2. **伪字段豁免**：伪字段 `_ts`（ISO 时间戳）和 `_tag`（方括号标签）不是 logfmt kv 字段——它们由 L2 抽取器从行结构（ISO 时间戳、方括号标签）推断，行里没有 `_ts=` / `_tag=` 子串可粗筛。若下推，L1 会淘汰所有含真实时间戳/标签的行，破坏 `L1 ⊇ L2`。故伪字段不参与前缀粗筛，L2 抽取后判定。
+
+3. **Or 子树豁免（B15，v0.48）**：前缀粗筛是「每个引用字段前缀必须存在」的 AND 语义，而 Or 分支的谓词只需任一分支成立。若下推 Or 内部谓词的字段前缀，只满足另一分支的行会被 L1 误杀——`level in [ERROR] || "plain"` 丢掉 plain-only 行（`L1 ⊇ L2` 违反，v0.47 前装，`--verify` 报「暴力独有」）。故 Or 子树内不收集字段前缀，L2 全树精判承担语义。与 Not 子树豁免同构（B14 只审了字面量组完整性，未审前缀收集的 Or 豁免——镜像遗漏）。
 
 ### 3.3 字段抽取（Late Materialization）
 
@@ -416,6 +443,7 @@ L4  rank(BM25 over 候选集) → top-k → fields/json → trace(多行 stack t
 **字段不存在的语义**（对 `!` 和数值谓词的影响）：
 - 行 `INFO started`（无 cost 字段），`cost>800` 谓词为假
 - `!(cost>800)` 谓词为真 → **这行被命中**
+- 字符串等值同语义：无 level 字段的行 `level="ERROR"` 为假，`!(level="ERROR")` 命中（脱糖为 in 后"字段不存在 = 谓词假"原规则自动适用，§3.2）
 - 如要表达"cost 字段存在且 ≤800"，必须显式写：`cost exists && !(cost>800)`
 - 与 grep `-v` 的差异：grep `-v PATTERN` 是行级否定，不区分"字段存在/不存在"；gxp `!` 是谓词级否定，对无字段行视为谓词为假再取反
 

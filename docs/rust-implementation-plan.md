@@ -14,7 +14,7 @@
 |---|---|---|---|
 | **L1 引擎** | regex crate + regex-syntax literal extraction + aho-corasick | `regex = "1.10"`, `regex-syntax = "0.8"`, `aho-corasick = "1.0"` | regex crate 自带 literal extraction（内部 meta engine）；`regex_syntax::hir::literal::Extractor` 公开抽取必选字面量；aho-corasick 1.0 SIMD 化的多模式字面量匹配。**无需 fork grep 或 fork ripgrep。** |
 | **L1 调度壳** | 直接用 ripgrep 的 `grep-searcher` 作为可选 L1 引擎 | `grep-searcher = "0.1"`, `grep-regex = "0.1"`, `grep-matcher = "0.1"` | 不 fork、只依赖：`Searcher::search_slice` + `Sink` trait 提供行级扫描 + 偏移；MPL-2.0 允许商业使用。 |
-| **L2 字段抽取** | 手写状态机 + memchr 加速 + serde_json/simd-json for JSON | `memchr = "2.7"`, `simd-json = "0.13"` (optional) | 手写状态机用 memchr 的 SIMD `memchr2(b'=', b':', ...)` 找分隔符，目标 20ms（实测见 performance-baseline §1.1）。 |
+| **L2 字段抽取** | 手写状态机 + memchr 加速 + serde_json/simd-json for JSON | `memchr = "2.7"`, `simd-json = "0.13"` (optional) | 手写状态机用 memchr 的 SIMD `memchr2(b'=', b':', ...)` 找分隔符，设计目标 20ms（旧机口径，v0.49 起锚点见 §0 性能预期）。 |
 | **L3 结构层** | ast-grep-language + tree-sitter fallback | `ast-grep-core = "0.45"`, `ast-grep-language = "0.45"` | ast-grep 的 `useQuery($A)` 语法比 tree-sitter 原生 S-expression 更接近 LLM 习惯；ast-grep-language 自带 ~20 种语言。 |
 | **目录层** | ignore (Gitignore 匹配器) + blake3 + globset + rayon | `ignore = "0.4"`, `blake3 = "1.4"`, `globset = "0.4"`, `rayon = "1.10"` | 手写 `std::fs::read_dir` 栈式遍历（避开 WalkBuilder 固定开销，实测数据见 performance-baseline §1.4）；ignore 保留为 `.gitignore` 独立匹配器；globset 做 `--glob` 文件名过滤；rayon 跨文件并行扫描。 |
 | **SIMD** | memchr（默认 SIMD）+ simd-json（JSON 路径 optional） | 同上 | 不碰 `std::simd`（nightly-only）也不碰 `packed_simd`（已弃用）。memchr 在 x86_64/aarch64 上自动 dispatch AVX2/SSE2/NEON。 |
@@ -31,7 +31,7 @@
 
 ### 性能预期
 
-> 当前实测数据详见 `docs/performance-baseline.md §1.1`（权威源）。目标：全管道 <80ms / L2 字段抽取 20ms / L1 两遍链 30ms，全部达标。
+> 当前实测数据详见 `docs/performance-baseline.md §1.1-1.2`（权威源）。基线锚点（v0.49 起本机 i7-10700，AGENTS.md §7.1 回归性门禁：median 劣化 >10% 需归因）：全管道 106.74ms（diag median）/ L1 两遍链 33.51ms / L2 字段抽取 8.21ms（v0.47 criterion）；旧机 80/30/20ms 目标降历史参考（跨机比值 1.52-1.85×，perf-baseline §1.1 机器变更说明）。
 
 ---
 
@@ -306,6 +306,51 @@ gxp **不是 grep 的严格超集**（D1），不接受 grep 短选项参数。�
 | ERE OR `\|` vs gxp 管道歧义 | 中 | 规则：引号内 `\|` 是 ERE OR；引号外是 gxp 管道 |
 | `!` 词法规则嵌套 | 低 | 递归下降解析器自然处理 |
 
+### 7.8 字符串等值脱糖（v0.48）
+
+> 见 `src/dsl/parser.rs::pred_compare` + `src/mode/detect.rs::has_field_predicate` + `src/mode/gxp.rs::enrich_string_eq_hint`。设计文档 §3.2「字符串等值脱糖」+ §2.4 示例 2a。动机：agent A/B 实验第一摩擦源（3/8 agent 自然写出 `level="ERROR"` 被 v0.47 runtime 数值错误拒绝，见 `docs/agent-ab-experiment.md`）。
+
+- **脱糖**：`NAME ("="|"==") "STRING"` 在 `pred_compare` 解析期直接构造 `Pred::In { values: [STRING] }`——AST/L1/L2 无新增节点与分支，Or 组完整性（B14）/ Not 子树豁免 / 伪字段 / captures 优先级全部自动继承 `in` 现有路径
+- **消歧规则**（实测钉死 v0.47 基线后确定）：
+  - 带引号 RHS + `=`/`==` → 字符串等值（单元素 In）
+  - 带引号 RHS + `!=`/`>`/`>=`/`<`/`<=` → `pred_compare` 返回 Err + prim 层 shape guard 拦截（不落 BARE 兜底，v0.42 静默吞同类），hint 由 `enrich_string_eq_hint` 附加（字符串无大小序；`!=` 正确写法是 `!(NAME="...")`）
+  - 无引号 RHS 数值开头 → 数值等值（Compare，D5 原样）
+  - 无引号 RHS 非数值 + `=`（单等号）→ pred 返回 Err 落 BARE 兜底 = ERE 字面量（**对齐设计文档"`=` 不在 BARE 谓词分歧操作符列表"**；v0.47 实测 `a=b` 报 runtime 数值错误，属文档-实现不一致，v0.48 修正）
+  - 无引号 RHS 非数值 + `==` → 保持 D5 runtime 拒绝（`==` 在文档中是有意分歧操作符，不回退 BARE）
+- **模式检测**：`has_field_predicate` 对 `字母=` 增加 RHS 前瞻——越过连续 `=` 与空白后首字符为数字/`-`/`+`/`.` 才判谓词特征；`==`（两个及以上）仍无条件触发。`a=b` 由此回归 BARE/ERE 通道（`level="ERROR"` 经双引号规则照常进 gxp 模式）
+- **B14 教训落实**：e2e 独立期望集（`tests/cli_string_eq.rs`：等值三元等价 / Not 补集 / Or 组混字面量 / capture 字段 / 伪字段 / BARE `a=b` 回归 / 两条 hint 错误路径），不依赖 `--verify`（暴力与优化共用 L1 编译同错对齐）
+
+### 7.9 L2 Literal 重校验豁免 + collect 零分配化（v0.49 T1a）
+
+> 见 `src/l1/compiler.rs::verified_literals` + `src/mode/prepared.rs` + `src/mode/eval.rs` + `src/mode/detect.rs::find_match_bytes`。动机：v0.48 T1a 基线锚定（perf-baseline §1.2）发现 125.30ms 中 **~30ms 未归因差值**，diag 复刻检查点归因为 collect 路径三项冗余（合计 ~16ms 实测增量）+ 相位隔离测量理想化残差 ~11ms。
+
+**归因数据**（diag_pipeline 复刻阶段，2026-11-09，i7-10700）：
+
+| 冗余项 | 实测增量 | 机理 |
+|---|---|---|
+| L2 Literal `regex.is_match` 重校验 | +5.8ms / 141367 行 | L1 必选组 aho 命中已保证字面量存在，L2 全树精判再跑一次转义正则 |
+| path 填充 `String::clone` | ~6.5ms / 103607 行 | 单文件模式所有命中行共享同一路径，却每行堆分配一个 String |
+| `find_match_bytes` 二次 aho + `Vec::clone` | ~3.6ms / 103607 行 | 单元素纯字面量组命中即确定 `_match` 值，无需再 find + 每行分配 |
+
+**Opt A（Literal 重校验豁免）**：`compile()` 产出 `verified_literals: Vec<Vec<u8>>`——仅收**单元素纯字面量必选组**的成员；`prepare_expr` 据此给 `PreparedPrim::Literal` 置 `l1_verified` 标志；eval 命中标志直接返回 `True` 不跑 regex。
+
+健全性论证（构造性，三条）：
+1. **单元素组 any-hit ≡ 字面量存在**：必选组全部命中才进 L1 回调；组内仅一个 `regex::escape` 转义字面量，any-hit ⟺ 该子串在行内 ⟺ L2 的 `regex.is_match`（同 pattern）。这是 §15「L1 纯字面量组跳过 regex verify」决策在 L2 侧的同一论证。
+2. **Or 分支组永不单元素**：`collect_or_literals` 的每个 complete 叶子（String/Bare，含 Paren 递归）至少推进 1 个字面量，Or 有两支 → 组 ≥2 元素（compiler.rs Or 分支推组处不可能产出单元素组）。Or/Not 侧字面量因而不入集——B15 场景（`level in [ERROR] || "plain"`）plain 不豁免。
+3. **Paren(And) 陷阱**：`"a" && ("b" && "c")` 的 Paren 内 And 组因 B14 完整性规则**整组放弃**（collect_or_literals 对 And 返回 false），b/c 无 L1 组——朴素的「路径只经 And/Paren 即已验证」规则不健全。故验证集必须由 `compile()` 按实际推组结果产出，不做树路径平行实现（§6.5.3 同构镜像教训）。
+
+同串多出现语义：某串入集 ⟺ 每条 L1 幸存行必含该子串 ⟺ 树中**任意位置**的同串 Literal 节点求值为 True（含 Not 内——`Not(已保证存在的字面量)` 恒 False，与跑 regex 结果一致）。集合按串去重语义健全。
+
+**B14 教训落实**：`run_verify` 暴力与优化路径共用 `PreparedScan::build`（verify.rs:34）——豁免标志不健全时两侧同错对齐，`--verify` 不可发现。必须走独立期望集 e2e（`tests/cli_l1_verified.rs`：And 单例豁免 / Paren(And) 不豁免 / Or 侧不豁免 / Not 侧语义 / 同串跨子树）。
+
+**Opt B（match_bytes 零分配）**：`LiteralGroup.literals: Vec<Vec<u8>>` → `Vec<Arc<[u8]>>`；`MatchedLine.match_bytes: Option<Vec<u8>>` → `Option<Arc<[u8]>>`；`find_match_bytes` 对单元素纯字面量组跳过 aho find 直接 `Arc::clone`（命中即该字面量，无需鉴别）。多元素组保留 find（需鉴别命中的是哪个 pattern），返回 `Arc::from(bytes)`。
+
+**Opt C（path 零分配）**：`MatchedLine.path: Option<String>` → `Option<Arc<str>>`，填充/克隆点全部 refcount 化（gxp.rs 两处填充循环 / pipeline/mod.rs 入口补填 / context 复制点 / dir 层收集）。
+
+**范围外**：残差 ~11ms（相位隔离理想化 + PreparedScan::build + 分发开销）不在本轮；samply 在本机编译失败（v0.13.1），归因以 diag 复刻检查点为准。
+
+**残差归因补记（2026-11-09 晚，C1/C2/C3 判别实验，diag_pipeline 新增检查点）**：残差 ~13.7ms（108.55 − 阶段累计 94.84）拆为三桶各 4-6ms——① 生产 collect 口径差 ~6.0（match_bytes/path 逐行填充，`_match`/`_file` 语义必需）② 链内相位交错 ~4.8（端到端固有）③ 生产专属 ~4.1（eval 机制 + CaptureMap::new × 141k + dispatch；build <0.1ms）——无单一大头。CaptureMap 空表共享预估 <2ms 且需动 with_captures 边界，收益/风险比不足，**暂不做**。数据与判别式见 perf-baseline §1.2 残差归因块。
+
 ---
 
 ## 8. 测试与验证
@@ -460,8 +505,9 @@ gxp **不是 grep 的严格超集**（D1），不接受 grep 短选项参数。�
 | `fields` 自定义分隔符 | 弱（默认空格已覆盖 90%，自定义分隔符场景稀疏） | 无 | 无 | **仍保持暂不评估**：场景稀疏。升级条件：CSV/TSV 日志场景频繁 |
 | 多行 JSON 合并（原候选 #4） | 弱（K8s/Docker 生产日志默认单行 JSONL；配置文件 LLM 直接 Read；多行 JSON 在真实 LLM 工作流稀疏） | 无（方案 c：L4 合并与 trace 同构；方案 b：L2 改造风险中） | `jq -c '.' multiline.log \| gxp 'cost_ms>500'`（jq 预处理转单行 JSONL） | **仍保持暂不评估**：re-triage 后从候选 #4 转入。起源是 2026-10-22 某低代码平台 评估副产品，场景 A 是事后合理化，不是真实 LLM 工作流驱动需求（违反 §0.1 第 1 条）。升级条件：用户明确报告多行 JSON 日志场景频繁 + jq 预处理负担重 |
 | `--verify-large` 分块 verify | 弱（>512MB 单文件 --verify 拒绝场景，但 --verify 是 gxp 开发者不变式校验，非 LLM agent 工作流驱动） | 中（边界跨行处理：context N / trace 续行跨块易出 bug；run_verify 暴力路径 Vec<(usize, Vec<u8>)> 全量命中行 clone 内存模型不变） | 用户 `split -C 500M bigfile.log chunk_` + 逐块 `gxp 'pattern' chunk_* --verify`；或 `head -c 500M bigfile.log \| gxp 'pattern' /dev/stdin --verify` | **仍保持暂不评估**（v0.42 评估，2026-10-27）：§0.1 第 1 条场景驱动不通过（非 LLM agent 工作流）+ 第 4 条等价组合替代已存在（用户 split 即可）。升级条件：用户报告 split 语法负担重 + 频繁需要 >512MB 单文件 verify |
+| 流式性能三件套（性能项，非功能）：#1 块式流式扫描（8MB 块 + 块内 `scan_lines_cb` + 跨块行 carry，替代 `read_until` 逐行）/ #2 聚合 stage 免收集（count/files/stats 命中即计数，跳过 MatchedLine 构造）/ #3 单字面量 AC→memmem 特化 | 中（流式仅 >512MB 单文件触发，场景 A/D 大文件变体；P2 实测本机流式 ~790 MiB/s 慢于 rg ~1.9 GiB/s 达 2.4×，perf-baseline §1.3.2；但 P2 诚实结论"gxp 价值不在裸吞吐"——排期应取决于 P3 agent A/B 实验是否要求大文件吞吐竞争力） | #1 低（语义不变，块边界/CRLF/末行语义已有测试锚定）；#2 中（B1 终止 stage 语义 + §6.4 组合矩阵需 e2e）；#3 低（L1 编译期特化，`L1 ⊇ L2` 不变） | 无等价组合（性能优化）；用户侧缓解 = 数据源头分卷（同 `--verify-large` 行的 split 思路） | **暂不评估**（2026-11-09 记录，P2 副产品）：预期收益为推算非承诺——#1 估 1137→850-950ms、#+2 估→650-800ms（900MB count 口径，反超 grep 但仍慢 rg ~1.4×，残余差距是专用扫描器护城河）。升级条件：P3 agent A/B 结论要求大文件场景竞争力，或用户报告 >512MB 单文件查询频繁且延迟不可接受 |
 
-**re-triage 结论**：13 项中 2 项永久拒绝（T2/T3、SIMD JSON 强制启用，均因 D 系硬约束根本冲突），11 项仍保持暂不评估（含 v0.42 评估新增的 `--verify-large`）。无升级为候选。判据核心是 §0.1 场景驱动 + D 系硬约束根本冲突检查。
+**re-triage 结论**：16 项中 2 项永久拒绝（T2/T3、SIMD JSON 强制启用，均因 D 系硬约束根本冲突），14 项仍保持暂不评估（含 v0.42 评估新增的 `--verify-large` + 2026-11-09 新增的流式性能三件套，后者为性能项非功能项）。无升级为候选。判据核心是 §0.1 场景驱动 + D 系硬约束根本冲突检查。
 
 ---
 
@@ -614,6 +660,8 @@ gxp/
 | JSON 输出字段补全 | `MatchedLine` 新增 `path` + `captures` + `match_bytes` | 只补 path | 7 个 `--json` 输出问题修复 |
 | 多字段批量提取（算法层） | `batch_find_values` n≥3 走 batch | SIMD intrinsics / 全部走 find_value | bench 实测：n=5 +137%、n=8 +288%、n=12 +344% |
 | MatchedLine.line: Arc<[u8]> | `line: Vec<u8>` → `Arc<[u8]>` | 借用 `&'a [u8]`（破坏 Send+Sync）/ 全面 Arc 化 | 唯一不破坏 V1 Send+Sync 的 L1 改动；大文件场景自动受益 |
+| 字符串等值 `NAME="STRING"` 解析期脱糖为单元素 In（v0.48） | 脱糖（零新 AST 节点） | 新增 Pred::EqString 变体 + L1/L2 分支 | A/B 实验第一摩擦源；构造性等价消除 L1/L2 镜像风险（§6.5.3 B14 类）；`=` 单等号非数值 RHS 同时回归 ERE 字面量（对齐设计文档分歧操作符列表） |
+| L2 Literal 重校验豁免 + collect 零分配化（v0.49） | `verified_literals`（单元素纯字面量必选组成员）+ `l1_verified` 标志 + match_bytes/path Arc 化 | 树路径平行判定（Paren(And) 陷阱不健全）/ 惰性 match_bytes（需 compiled 穿透 stage 层） | T1a 归因 ~16ms 三项冗余实测；豁免健全性构造性论证见 §7.9；--verify 共用 build 同错对齐 → 独立期望集 e2e 强制 |
 
 ---
 

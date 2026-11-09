@@ -88,9 +88,18 @@ pub(crate) enum PreparedPrim {
     /// L2 实际跑 `is_match` 校验：
     /// - 非 Not 上下文：L1 已 filter，L2 校验冗余但正确（不漏不增）
     /// - Not 上下文：L1 未 filter，L2 校验是必需的（否则 Not 语义破裂）
+    ///
+    /// **v0.49 Opt A（`l1_verified`，Rust 方案 §7.9）**：当该字面量字符串是
+    /// `CompiledL1::verified_literals` 成员（单元素纯字面量必选组）时，
+    /// L1 幸存行构造性保证子串存在，L2 豁免 `regex.is_match` 重校验直接 True。
+    /// 同串跨子树（含 Not 内）语义一致：行必含该子串 ⇒ 任意位置同串节点恒 True。
+    /// Regex 字面量永不 verified（L1 不保证正则命中——aho 只有字面量）。
     Literal {
         /// 编译后的正则（String/Bare 用 `regex::escape` 转义，Regex 用原文）。
         regex: regex::bytes::Regex,
+        /// L1 已构造性保证该字面量存在（`verified_literals` 成员）时为 true，
+        /// eval 豁免重校验。where 等无 L1 保证的上下文构造时传空集 → false。
+        l1_verified: bool,
     },
     /// 预编译字段谓词。
     Pred(PreparedPred),
@@ -123,28 +132,32 @@ pub(crate) enum PreparedPrim {
 
 /// 把 AST `Expr` 编译为 `PreparedExpr`：递归 walk，Pred 节点预解析阈值/边界。
 ///
+/// `verified`：L1 已构造性保证存在的字面量集合（`CompiledL1::verified_literals`），
+/// String/Bare 字面量命中时置 `l1_verified=true`（v0.49 Opt A）。
+/// 无 L1 保证的上下文（apply_where 等）传 `&[]`。
+///
 /// 错误（fail-loud）：
 /// - `Compare` 阈值不是合法数值（11 维契约拒绝）→ `GxpError::Runtime`
 /// - `Between` 端点不是合法数值 → `GxpError::Runtime`
-pub(crate) fn prepare_expr(expr: &Expr) -> crate::Result<PreparedExpr> {
+pub(crate) fn prepare_expr(expr: &Expr, verified: &[Vec<u8>]) -> crate::Result<PreparedExpr> {
     match expr {
         Expr::Or(l, r) => Ok(PreparedExpr::Or(
-            Box::new(prepare_expr(l)?),
-            Box::new(prepare_expr(r)?),
+            Box::new(prepare_expr(l, verified)?),
+            Box::new(prepare_expr(r, verified)?),
         )),
         Expr::And(l, r) => Ok(PreparedExpr::And(
-            Box::new(prepare_expr(l)?),
-            Box::new(prepare_expr(r)?),
+            Box::new(prepare_expr(l, verified)?),
+            Box::new(prepare_expr(r, verified)?),
         )),
-        Expr::Not(e) => Ok(PreparedExpr::Not(Box::new(prepare_expr(e)?))),
-        Expr::Prim(prim) => Ok(PreparedExpr::Prim(prepare_prim(prim)?)),
+        Expr::Not(e) => Ok(PreparedExpr::Not(Box::new(prepare_expr(e, verified)?))),
+        Expr::Prim(prim) => Ok(PreparedExpr::Prim(prepare_prim(prim, verified)?)),
     }
 }
 
 /// 编译 `Prim` 节点。
-pub(crate) fn prepare_prim(prim: &Prim) -> crate::Result<PreparedPrim> {
+pub(crate) fn prepare_prim(prim: &Prim, verified: &[Vec<u8>]) -> crate::Result<PreparedPrim> {
     match prim {
-        Prim::Paren(e) => Ok(PreparedPrim::Paren(Box::new(prepare_expr(e)?))),
+        Prim::Paren(e) => Ok(PreparedPrim::Paren(Box::new(prepare_expr(e, verified)?))),
         // v0.42：Literal 携带编译后的正则，供 L2 实际校验（修复 Not(Literal) bug）
         Prim::String(s) | Prim::Bare(s) => {
             // 字面量子串匹配：regex::escape 转义后作为 pattern
@@ -152,13 +165,22 @@ pub(crate) fn prepare_prim(prim: &Prim) -> crate::Result<PreparedPrim> {
             let re = regex::bytes::Regex::new(&pattern).map_err(|e| crate::GxpError::Runtime {
                 detail: format!("字面量正则编译失败: {e}"),
             })?;
-            Ok(PreparedPrim::Literal { regex: re })
+            // v0.49 Opt A：verified 成员 → L2 豁免重校验（Rust 方案 §7.9）
+            let l1_verified = verified.iter().any(|v| v.as_slice() == s.as_bytes());
+            Ok(PreparedPrim::Literal {
+                regex: re,
+                l1_verified,
+            })
         }
         Prim::Regex(r) => {
             let re = regex::bytes::Regex::new(r).map_err(|e| crate::GxpError::Runtime {
                 detail: format!("REGEX 字面量编译失败: {e}"),
             })?;
-            Ok(PreparedPrim::Literal { regex: re })
+            // Regex 永不 l1_verified：L1 aho 只含字面量，不保证正则命中
+            Ok(PreparedPrim::Literal {
+                regex: re,
+                l1_verified: false,
+            })
         }
         Prim::Pred(p) => Ok(PreparedPrim::Pred(prepare_pred(p)?)),
         Prim::Ast { lang, pattern } => Ok(PreparedPrim::Ast {

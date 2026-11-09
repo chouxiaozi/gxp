@@ -10,8 +10,8 @@
 # 不修改系统注册表、不写 .cargo/config.toml — 那些由 scoop 持久化。
 # 本脚本只保证"在任意新 PowerShell 会话里 source 一次即可用 cargo/rustc/gcc"。
 
-# Scoop 根（根据实际安装路径；如迁移机器改这里即可）
-$ScoopRoot = "D:\soft\scoop"
+# Scoop 根（默认 ~/scoop；装在自定义路径时由环境变量 SCOOP 提供）
+$ScoopRoot = if ($env:SCOOP) { $env:SCOOP } else { "$env:USERPROFILE\scoop" }
 
 # Rust GNU toolchain
 $env:CARGO_HOME  = "$ScoopRoot\persist\rustup\.cargo"

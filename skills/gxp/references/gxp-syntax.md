@@ -1,7 +1,7 @@
 # gxp 语法速查
 
 > 来源：AGENTS.md §2 语法锚点 + capability-matrix §1 + design §2.4 示例
-> 更新：2026-10-27（v0.42 全量）
+> 更新：2026-11-09（v0.48 全量）
 
 ## BARE 模式（与 `grep -E` 等价）
 
@@ -21,6 +21,7 @@ gxp 'a|b' app.log                            # ERE 的 OR
 | 正则字面量 | `/.../` | `/req-\d+/` |
 | 数值比较 | `field op N` | `cost_ms>800` / `latency<=50` / `count==0` / `status!=200` |
 | 集合成员 | `field in [a,b,c]` | `_tag in [checkout,billing]` |
+| 字符串等值（v0.48） | `field="VALUE"` / `field=="VALUE"` | `level="ERROR"`（解析期脱糖单元素 In；`!=`/`>` 带引号 fail-loud） |
 | 区间 | `field between X and Y` | `_ts between "T1" and "T2"` / `cost_ms between 100 and 500` |
 | 字段存在 | `field exists` | `cost_ms exists` |
 | 逻辑 | `&&` / `||` / `!` | `"error" && !timeout` / `!(cost>800)` |
@@ -43,7 +44,7 @@ gxp 'a|b' app.log                            # ERE 的 OR
 | `_ts` | 行首 ISO 8601 时间戳 | `_ts between "T1" and "T2"` |
 | `_tag` | 行内 `[tag]` 标记 | `_tag in [checkout,billing]` |
 
-## 管道动词（v0.42 全量 13 个）
+## 管道动词（v0.48 全量 14 个）
 
 | 动词 | 语义 | 等价 grep / 备注 |
 |---|---|---|
@@ -68,10 +69,12 @@ gxp 'a|b' app.log                            # ERE 的 OR
 ## AST 结构查询
 
 ```bash
-gxp 'ast(LANG, "PATTERN")' <dir> --features l3-structural
+gxp 'ast(LANG, "PATTERN")' <dir>
 ```
 
-**支持语言**（v0.42 全量 9 种）：`ts` / `rs` / `py` / `js` / `go` / `tsx` / `java` / `c` / `cpp`。大小写不敏感 + 别名（`c++`/`cxx`/`cc` → `cpp`）。
+**前置条件**：ast() 需要二进制构建时启用 `l3-structural` feature（`cargo build --features l3-structural --release`）；查询侧没有 `--features` 旗标，默认构建遇 `ast()` 会 fail-loud 提示重建。
+
+**支持语言**（v0.48 全量 9 种）：`ts` / `rs` / `py` / `js` / `go` / `tsx` / `java` / `c` / `cpp`。大小写不敏感 + 别名（`c++`/`cxx`/`cc` → `cpp`）。
 
 **ast-grep 模式语法**：
 - `$VAR` — 单节点捕获
@@ -99,7 +102,6 @@ gxp 'ast(cpp, "namespace $NS { $$$B }")' src/         # C++ namespace 声明
 | `--strict` | 字段探活 fail-loud（写错字段名直接报错） |
 | `--glob PATTERN` | 文件名过滤（如 `--glob '*.rs'`） |
 | `--no-gitignore` | 覆盖默认 .gitignore 尊重 |
-| `--features l3-structural` | 启用 ast() 结构查询 |
 | `--generate-completion SHELL` | shell completion（bash/zsh/fish/ps） |
 
 ## 输出字段（JSON 模式自包含）

@@ -1,4 +1,4 @@
-//! L1 扫描基准（对齐 §7.1 v1 性能目标：< 30ms）。
+//! L1 扫描基准（对齐 §7.1 基线锚点：本机 33.51ms = v0.49 diag median）。
 //!
 //! 合成 44MB 日志（~400k 行），查询 `"timeout" && cost_ms>800`：
 //! - L1 两遍链 = aho-corasick 字面量 "timeout" + 字段名前缀 `cost_ms=` 粗筛
@@ -21,7 +21,7 @@ use gxp::dsl::parser::parse_query_inline;
 use gxp::l1::compiler::compile;
 use gxp::l1::scan::scan_lines_cb;
 
-/// 合成语料大小：~44MB（对齐 §7.1 v1 目标 + §11.1 MVP 验收 44MB/40 万行）。
+/// 合成语料大小：~44MB（对齐 §7.1 指标口径 + §11.1 MVP 验收 44MB/40 万行）。
 const CORPUS_BYTES: usize = 44 * 1024 * 1024;
 
 /// fixtures 路径（.gitignore 忽略，不进 git）。

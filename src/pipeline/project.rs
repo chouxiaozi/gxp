@@ -196,7 +196,7 @@ mod tests {
     fn test_projection_match_returns_match_bytes() {
         // _match = L1 匹配的字节（等价 grep -o）
         let mut m = MatchedLine::new(1, b"ERROR cost_ms=900");
-        m.match_bytes = Some(b"ERROR".to_vec());
+        m.match_bytes = Some(std::sync::Arc::from(b"ERROR".as_ref()));
         let out = apply_projection(&[m], &[b"_match"]);
         assert_eq!(texts(&out), vec!["ERROR"]);
     }
@@ -221,7 +221,7 @@ mod tests {
     fn test_projection_file_returns_path() {
         // _file = 文件路径
         let mut m = MatchedLine::new(1, b"ERROR");
-        m.path = Some("src/main.rs".to_string());
+        m.path = Some(std::sync::Arc::from("src/main.rs"));
         let out = apply_projection(&[m], &[b"_file"]);
         assert_eq!(texts(&out), vec!["src/main.rs"]);
     }
@@ -239,8 +239,8 @@ mod tests {
         // 投影后 captures 和 path 保留
         let mut m = MatchedLine::new(1, b"ERROR cost_ms=900");
         m.captures.insert("uid".to_string(), b"user=alice".to_vec());
-        m.path = Some("app.log".to_string());
-        m.match_bytes = Some(b"ERROR".to_vec());
+        m.path = Some(std::sync::Arc::from("app.log"));
+        m.match_bytes = Some(std::sync::Arc::from(b"ERROR".as_ref()));
         let out = apply_projection(&[m], &[b"cost_ms"]);
         assert_eq!(out.len(), 1);
         assert_eq!(texts(&out), vec!["900"]);
@@ -254,7 +254,11 @@ mod tests {
             "captures 应保留"
         );
         // path 保留
-        assert_eq!(out[0].path, Some("app.log".to_string()), "path 应保留");
+        assert_eq!(
+            out[0].path,
+            Some(std::sync::Arc::from("app.log")),
+            "path 应保留"
+        );
         // match_bytes 保留
         assert_eq!(
             out[0]

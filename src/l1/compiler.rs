@@ -11,6 +11,7 @@
 
 use aho_corasick::AhoCorasick;
 use regex::bytes::Regex;
+use std::sync::Arc;
 
 use crate::dsl::ast::{CmpOp, Expr, Pred, Prim};
 
@@ -37,6 +38,16 @@ pub struct CompiledL1 {
     /// 字段谓词描述符（L2 消费）：字段名 + 操作符 + 阈值字节。
     /// L1 不解析阈值，原样透传给 L2（11 维格式契约，D5）。
     pub field_predicates: Vec<FieldPredicate>,
+    /// **L1 已构造性保证存在的字面量**（v0.49 Opt A，Rust 方案 §7.9）：
+    /// 单元素纯字面量必选组的成员集合。L1 幸存行必含该子串
+    /// （组间 AND 全命中 + 单元素组 any-hit ≡ 该字面量 is_match），
+    /// L2 对树中同串 `PreparedPrim::Literal` 节点可豁免 `regex.is_match` 重校验。
+    ///
+    /// 健全性边界（三条，详见 Rust 方案 §7.9）：
+    /// - Or 分支组永不单元素（每个 complete 叶子至少推进 1 字面量，Or 两支 ≥2）
+    /// - Paren(And) 组因 B14 完整性规则整组放弃 → 其字面量不入集
+    /// - 同串多出现：某串入集 ⟺ 行必含该子串 ⟺ 树中任意位置同串节点求值恒 True
+    pub verified_literals: Vec<Vec<u8>>,
 }
 
 /// 必选组：一组字面量候选 + 精判正则。
@@ -53,8 +64,10 @@ pub struct LiteralGroup {
     pub fast: AhoCorasick,
     /// 精判：完整正则（`is_match`）。
     pub verify: Regex,
-    /// 字面量列表（用于 `--explain` 展示与调试）。
-    pub literals: Vec<Vec<u8>>,
+    /// 字面量列表（用于 `--explain` 展示与调试 + `find_match_bytes` 快速路径）。
+    /// `Arc<[u8]>`（v0.49 Opt B）：单元素纯字面量组命中即确定 `_match` 值，
+    /// `find_match_bytes` 直接 Arc clone 免 aho 二次查找 + 每行 Vec 分配。
+    pub literals: Vec<Arc<[u8]>>,
     /// 是否纯字面量组（无 `Prim::Regex` 成员）。
     /// true 时 aho-corasick 命中即等价 regex 命中，跳过 verify 第二遍。
     pub is_pure_literal: bool,
@@ -196,9 +209,10 @@ fn prefix_variants(name: &str) -> Vec<Vec<u8>> {
 /// - `Prim::Pred(p)`：不进字面量组，但字段名前缀进 `field_prefixes`。
 /// - `Prim::Paren(e)`：递归处理内部 expr。
 pub fn compile(expr: &Expr) -> Result<CompiledL1, CompileError> {
-    // 1. 收集必选组
+    // 1. 收集必选组（同时产出 verified_literals：单元素纯字面量组成员）
     let mut required_groups: Vec<LiteralGroup> = Vec::new();
-    collect_required_groups(expr, &mut required_groups)?;
+    let mut verified_literals: Vec<Vec<u8>> = Vec::new();
+    collect_required_groups(expr, &mut required_groups, &mut verified_literals)?;
 
     // 2. 收集字段谓词
     let mut field_predicates: Vec<FieldPredicate> = Vec::new();
@@ -235,35 +249,50 @@ pub fn compile(expr: &Expr) -> Result<CompiledL1, CompileError> {
         field_prefix_ac,
         field_prefix_pattern_to_field: pattern_to_field,
         field_predicates,
+        verified_literals,
     })
 }
 
 /// 递归收集必选组。
-fn collect_required_groups(expr: &Expr, out: &mut Vec<LiteralGroup>) -> Result<(), CompileError> {
+///
+/// `verified`：单元素纯字面量必选组成员收集（v0.49 Opt A）——仅在 Prim 分支
+/// 推组处判定（Or 分支组 ≥2 元素永不单元素，见 Rust 方案 §7.9 健全性论证）。
+fn collect_required_groups(
+    expr: &Expr,
+    out: &mut Vec<LiteralGroup>,
+    verified: &mut Vec<Vec<u8>>,
+) -> Result<(), CompileError> {
     match expr {
         Expr::And(l, r) => {
             // 左右独立组：先建左组，再建右组。
-            collect_required_groups(l, out)?;
-            collect_required_groups(r, out)?;
+            collect_required_groups(l, out, verified)?;
+            collect_required_groups(r, out, verified)?;
         }
         Expr::Or(l, r) => {
             // 合并到同一组：收集 OR 两边字面量到同一组。
+            //
+            // B14 修复：组内 any-hit 语义只在「每个分支都推进了字面量」时
+            // 才与析取语义一致。任一分支不推进字面量（And/Not 嵌套、Regex、
+            // Pred/Ast/Capture），部分字面量组成的必选组会误杀其余分支的
+            // 合法候选（违反 L1 ⊇ L2，如 `"a" && "b" || "c"` 丢掉只含 a∧b
+            // 的行、`"a" || /re/` 丢掉只匹配正则的行）。此时整组放弃
+            // （无字面量约束），交给 L2 全树精判。
             let mut group_literals: Vec<Vec<u8>> = Vec::new();
             let mut group_verify_patterns: Vec<String> = Vec::new();
             let mut group_has_regex = false;
-            collect_or_literals(
+            let l_complete = collect_or_literals(
                 l,
                 &mut group_literals,
                 &mut group_verify_patterns,
                 &mut group_has_regex,
             )?;
-            collect_or_literals(
+            let r_complete = collect_or_literals(
                 r,
                 &mut group_literals,
                 &mut group_verify_patterns,
                 &mut group_has_regex,
             )?;
-            if !group_literals.is_empty() {
+            if l_complete && r_complete && !group_literals.is_empty() {
                 out.push(build_literal_group(
                     &group_literals,
                     &group_verify_patterns,
@@ -277,17 +306,23 @@ fn collect_required_groups(expr: &Expr, out: &mut Vec<LiteralGroup>) -> Result<(
             let _ = e;
         }
         Expr::Prim(prim) => {
-            // 单 prim 独立成组。
+            // 单 prim 独立成组（仅当推进了字面量，B14 完整性规则）。
             let mut group_literals: Vec<Vec<u8>> = Vec::new();
             let mut group_verify_patterns: Vec<String> = Vec::new();
             let mut group_has_regex = false;
-            collect_prim_literals(
+            let complete = collect_prim_literals(
                 prim,
                 &mut group_literals,
                 &mut group_verify_patterns,
                 &mut group_has_regex,
             )?;
-            if !group_literals.is_empty() {
+            if complete && !group_literals.is_empty() {
+                // v0.49 Opt A：单元素纯字面量组 → 成员入 verified_literals。
+                // 单元素组 any-hit ≡ 该字面量子串存在（构造性，Rust 方案 §7.9）。
+                // Paren(Or) 推多字面量 → len ≥2 不入；含 Regex → has_regex 不入。
+                if group_literals.len() == 1 && !group_has_regex {
+                    verified.push(group_literals[0].clone());
+                }
                 out.push(build_literal_group(
                     &group_literals,
                     &group_verify_patterns,
@@ -300,27 +335,32 @@ fn collect_required_groups(expr: &Expr, out: &mut Vec<LiteralGroup>) -> Result<(
 }
 
 /// 从 OR 分支收集字面量到同一组。
+///
+/// 返回 `bool`：`true` = 所有分支都推进了字面量（组完整，any-hit 语义成立）；
+/// `false` = 存在不推进字面量的分支（B14），调用方必须放弃整组。
 fn collect_or_literals(
     expr: &Expr,
     literals: &mut Vec<Vec<u8>>,
     verify_patterns: &mut Vec<String>,
     has_regex: &mut bool,
-) -> Result<(), CompileError> {
+) -> Result<bool, CompileError> {
     match expr {
         Expr::Or(l, r) => {
-            collect_or_literals(l, literals, verify_patterns, has_regex)?;
-            collect_or_literals(r, literals, verify_patterns, has_regex)?;
+            let l_complete = collect_or_literals(l, literals, verify_patterns, has_regex)?;
+            let r_complete = collect_or_literals(r, literals, verify_patterns, has_regex)?;
+            Ok(l_complete && r_complete)
         }
-        Expr::Prim(prim) => {
-            collect_prim_literals(prim, literals, verify_patterns, has_regex)?;
-        }
-        // AND / NOT 嵌套在 OR 里：保守不提取字面量（复杂表达式不做字面量优化）。
-        Expr::And(_, _) | Expr::Not(_) => {}
+        Expr::Prim(prim) => collect_prim_literals(prim, literals, verify_patterns, has_regex),
+        // AND / NOT 嵌套在 OR 里：不提取字面量，且使所在 Or 组失效（B14）——
+        // 部分字面量组的 any-hit 语义与 `(A ∧ B) ∨ …` 不一致，会误杀候选。
+        Expr::And(_, _) | Expr::Not(_) => Ok(false),
     }
-    Ok(())
 }
 
 /// 从 prim 收集字面量 + 精判 pattern。
+///
+/// 返回 `bool`：`true` = 该 prim 推进了字面量（String/Bare，或括号包裹的
+/// 完整字面量组合）；`false` = 未推进（Regex/Pred/Ast/Capture）。
 ///
 /// `has_regex` 被置 true 当且仅当遇到 `Prim::Regex`——
 /// 用于 `build_literal_group` 设置 `is_pure_literal` 标记。
@@ -329,41 +369,46 @@ fn collect_prim_literals(
     literals: &mut Vec<Vec<u8>>,
     verify_patterns: &mut Vec<String>,
     has_regex: &mut bool,
-) -> Result<(), CompileError> {
+) -> Result<bool, CompileError> {
     match prim {
         Prim::String(s) | Prim::Bare(s) => {
             // 字面量子串匹配：用 regex::escape 转义后作为 pattern。
             let pattern = regex::escape(s);
             literals.push(s.as_bytes().to_vec());
             verify_patterns.push(pattern);
+            Ok(true)
         }
         Prim::Regex(r) => {
             // REGEX 字面量：用 pattern 本身作为精判。
             // 保守：不做字面量提取，整个 regex 作为 verify。
-            // 注：不 push literals——build_literal_group 检测空 literals 时返回 Err，
-            // 调用方跳过该组（不进 required_groups）。
+            // 不 push literals 且返回 false——regex 无法进 aho-corasick
+            // 字面量组，若 Or 其余分支的字面量仍组成必选组，会误杀只匹配
+            // regex 的行（B14，L1 ⊇ L2 违反）。
             *has_regex = true;
             verify_patterns.push(r.clone());
+            Ok(false)
         }
         Prim::Paren(e) => {
-            // 括号分组：递归处理内部 expr（保守合并到当前组）。
-            collect_or_literals(e, literals, verify_patterns, has_regex)?;
+            // 括号分组：递归处理内部 expr（完整性由内层判定传导）。
+            collect_or_literals(e, literals, verify_patterns, has_regex)
         }
         Prim::Pred(_) => {
-            // 字段谓词不进字面量组（交给 field_prefixes）
+            // 字段谓词不进字面量组（交给 field_prefixes），并使所在 Or 组失效。
+            Ok(false)
         }
         Prim::Ast { .. } => {
             // ast() 结构层查询无字节级下推（设计文档 §2.2 + §8.2）：
             // L1 视 ast() 为"可能命中"——不提取字面量，不淘汰候选。
-            // L3 阶段调 ast-grep find_all 做精判。
+            // 同时使所在 Or 组失效（B14 完整性规则）。
+            Ok(false)
         }
         Prim::Capture { .. } => {
             // capture() 正则捕获组无字节级字面量可提取：
             // L1 视 capture() 为"可能命中"——不提取字面量，不淘汰候选。
-            // L2 阶段对每行跑正则 find 做精判。
+            // 同时使所在 Or 组失效（B14 完整性规则）。
+            Ok(false)
         }
     }
-    Ok(())
 }
 
 /// 构造单个必选组。
@@ -399,7 +444,7 @@ fn build_literal_group(
     Ok(LiteralGroup {
         fast,
         verify,
-        literals: literals.to_vec(),
+        literals: literals.iter().map(|v| Arc::from(v.as_slice())).collect(),
         is_pure_literal: !has_regex,
     })
 }
@@ -453,10 +498,20 @@ fn collect_field_predicates_inner(
     out: &mut Vec<FieldPredicate>,
 ) {
     match expr {
-        Expr::And(l, r) | Expr::Or(l, r) => {
+        Expr::And(l, r) => {
             collect_field_predicates_inner(l, capture_names, out);
             collect_field_predicates_inner(r, capture_names, out);
         }
+        // B15（v0.48 修复）：Or 子树豁免——L1 前缀粗筛是「每个引用字段前缀必须存在」
+        // 的 AND 语义（l1_match 步骤 2），而 Or 分支的谓词只需任一分支成立。
+        // 若下推 Or 内部的字段前缀，只满足另一分支的行会被 L1 误杀——
+        // `level in [ERROR] || "plain"` 丢掉 plain-only 行，`--verify` 报
+        // 「暴力独有」（L1 ⊇ L2 违反，v0.47 前装，B14 只审了字面量组完整性
+        // 未审前缀收集的 Or 豁免，与 Not 子树豁免同构的镜像遗漏）。
+        // 代价：含谓词的 Or 查询退化为字面量组约束（纯谓词 Or 无约束），候选
+        // 增多但语义正确；「纯谓词 Or 前缀 any-hit 下推」列为性能候选（§11.3）。
+        // L2 不受影响：prepare_expr 独立走全树（Or/Not 分支递归求值）。
+        Expr::Or(..) => {}
         Expr::Not(_) => {
             // Not 子树豁免：L1 不下推 Not 内部的字段前缀（不变式 L1 ⊇ L2）。
             // L2 阶段 eval_prepared_with_captures 走 Expr::Not 分支递归求值，承担全部语义。
@@ -564,8 +619,59 @@ mod tests {
         assert!(compiled.field_predicates.is_empty());
         assert_eq!(
             compiled.required_groups[0].literals,
-            vec![b"error".to_vec()]
+            vec![std::sync::Arc::from(b"error".as_ref())]
         );
+    }
+
+    // --- B15（v0.48）：Or 子树前缀豁免 ---
+
+    #[test]
+    fn test_compile_or_with_pred_exempts_prefix_b15() {
+        // `level in [ERROR] || "plain"`：Or 内谓词不收集前缀——前缀粗筛是 AND
+        // 语义（l1_match 步骤 2 要求每个字段前缀存在），下推会误杀 plain-only
+        // 行（L1 ⊇ L2 违反，v0.47 前装，--verify 报「暴力独有」）
+        let expr = Expr::Or(
+            Box::new(Expr::Prim(Prim::Pred(Pred::In {
+                name: "level".to_string(),
+                values: vec!["ERROR".to_string()],
+            }))),
+            Box::new(expr_str("plain")),
+        );
+        let compiled = compile(&expr).expect("编译应成功");
+        assert!(
+            compiled.field_predicates.is_empty(),
+            "Or 内谓词不应收集前缀（B15 豁免）"
+        );
+        assert!(compiled.field_prefix_ac.is_none());
+        // B14：Or 混非字面量分支 → 整组放弃 → 无必选组
+        assert!(compiled.required_groups.is_empty());
+    }
+
+    #[test]
+    fn test_compile_or_numeric_pred_exempts_prefix_b15() {
+        // 同构镜像：数值谓词在 Or 内同样豁免
+        let expr = Expr::Or(
+            Box::new(expr_compare("cost_ms", CmpOp::Gt, "800")),
+            Box::new(expr_str("plain")),
+        );
+        let compiled = compile(&expr).expect("编译应成功");
+        assert!(
+            compiled.field_predicates.is_empty(),
+            "B15：Or 数值谓词同豁免"
+        );
+    }
+
+    #[test]
+    fn test_compile_and_with_pred_still_collects_prefix() {
+        // 对照：And 位置的谓词照常收集（AND 语义下前缀必选成立，优化保留）
+        let expr = Expr::And(
+            Box::new(expr_compare("cost_ms", CmpOp::Gt, "800")),
+            Box::new(expr_str("timeout")),
+        );
+        let compiled = compile(&expr).expect("编译应成功");
+        assert_eq!(compiled.field_predicates.len(), 1);
+        assert_eq!(compiled.field_predicates[0].field, "cost_ms");
+        assert!(compiled.field_prefix_ac.is_some());
     }
 
     #[test]
@@ -575,7 +681,7 @@ mod tests {
         assert_eq!(compiled.required_groups.len(), 1);
         assert_eq!(
             compiled.required_groups[0].literals,
-            vec![b"ERROR".to_vec()]
+            vec![std::sync::Arc::from(b"ERROR".as_ref())]
         );
     }
 
@@ -587,11 +693,11 @@ mod tests {
         assert_eq!(compiled.required_groups.len(), 2);
         assert_eq!(
             compiled.required_groups[0].literals,
-            vec![b"error".to_vec()]
+            vec![std::sync::Arc::from(b"error".as_ref())]
         );
         assert_eq!(
             compiled.required_groups[1].literals,
-            vec![b"timeout".to_vec()]
+            vec![std::sync::Arc::from(b"timeout".as_ref())]
         );
     }
 
@@ -603,8 +709,67 @@ mod tests {
         assert_eq!(compiled.required_groups.len(), 1);
         let lits = &compiled.required_groups[0].literals;
         assert_eq!(lits.len(), 2);
-        assert!(lits.contains(&b"error".to_vec()));
-        assert!(lits.contains(&b"timeout".to_vec()));
+        assert!(lits.contains(&std::sync::Arc::from(b"error".as_ref())));
+        assert!(lits.contains(&std::sync::Arc::from(b"timeout".as_ref())));
+    }
+
+    // --- B14：Or 组完整性规则 ---
+
+    #[test]
+    fn test_compile_or_with_and_branch_drops_group() {
+        // ("a" && "b") || "c"：And 分支不推进字面量 → 整组放弃（部分组会误杀 a∧b 候选）
+        let expr = Expr::Or(
+            Box::new(Expr::And(Box::new(expr_str("a")), Box::new(expr_str("b")))),
+            Box::new(expr_str("c")),
+        );
+        let compiled = compile(&expr).expect("编译应成功");
+        assert!(
+            compiled.required_groups.is_empty(),
+            "Or 含 And 分支不得产生部分字面量组（B14），实际: {:?}",
+            compiled.required_groups
+        );
+    }
+
+    #[test]
+    fn test_compile_or_with_regex_branch_drops_group() {
+        // "a" || /re/：Regex 不推进字面量 → 整组放弃（部分组会误杀只匹配正则的候选）
+        let expr = Expr::Or(
+            Box::new(expr_str("a")),
+            Box::new(Expr::Prim(Prim::Regex("re".to_string()))),
+        );
+        let compiled = compile(&expr).expect("编译应成功");
+        assert!(
+            compiled.required_groups.is_empty(),
+            "Or 含 Regex 分支不得产生部分字面量组（B14），实际: {:?}",
+            compiled.required_groups
+        );
+    }
+
+    #[test]
+    fn test_compile_nested_or_literals_still_merge() {
+        // ("a" || "b") || "c" → 嵌套 Or 全字面量仍合并单组（回归）
+        let expr = Expr::Or(
+            Box::new(Expr::Or(Box::new(expr_str("a")), Box::new(expr_str("b")))),
+            Box::new(expr_str("c")),
+        );
+        let compiled = compile(&expr).expect("编译应成功");
+        assert_eq!(compiled.required_groups.len(), 1);
+        assert_eq!(compiled.required_groups[0].literals.len(), 3);
+    }
+
+    #[test]
+    fn test_compile_and_with_regex_keeps_string_group() {
+        // "a" && /re/：String 侧独立成组（作为粗筛 sound），Regex 组跳过（回归）
+        let expr = Expr::And(
+            Box::new(expr_str("a")),
+            Box::new(Expr::Prim(Prim::Regex("re".to_string()))),
+        );
+        let compiled = compile(&expr).expect("编译应成功");
+        assert_eq!(compiled.required_groups.len(), 1);
+        assert_eq!(
+            compiled.required_groups[0].literals,
+            vec![std::sync::Arc::from(b"a".as_ref())]
+        );
     }
 
     // --- compile 字段谓词 ---
@@ -876,26 +1041,23 @@ mod tests {
 
     #[test]
     fn test_pure_literal_flag_cleared_for_regex_prim() {
-        // Prim::Regex 不 push literals → build_literal_group 返回 EmptyGroup
-        // → 该组不进 required_groups。故纯 Regex 不产生组。
-        // 混合 String + Regex 在 OR 中也如此（Regex 不 push literals，
-        // 但 String 会的，所以组存在且 has_regex=true）。
-        // 构造 "error" || /time./ ：
+        // v0.42 版本此测试断言 `"error" || /time./` 产生 1 个 has_regex 组
+        // （literals=[error]）——B14 判定该形态违反 L1 ⊇ L2：只匹配 /time./
+        // 而不含 "error" 的行会被部分组的 fast(aho-corasick) 误杀。
+        // v0.47 起 Or 含 Regex 分支整组放弃（无字面量约束），交 L2 全树精判。
         let expr = Expr::Or(
             Box::new(expr_str("error")),
             Box::new(Expr::Prim(Prim::Regex("time.".to_string()))),
         );
         let compiled = compile(&expr).expect("编译应成功");
-        assert_eq!(compiled.required_groups.len(), 1);
-        // 组内有 Regex → is_pure_literal = false
         assert!(
-            !compiled.required_groups[0].is_pure_literal,
-            "含 Prim::Regex 的组不应为纯字面量"
+            compiled.required_groups.is_empty(),
+            "Or 含 Regex 分支不得产生部分字面量组（B14），实际: {:?}",
+            compiled.required_groups
         );
-        // 确认组内确实有 String 的字面量（否则该组不会存在）
-        assert!(compiled.required_groups[0]
-            .literals
-            .contains(&b"error".to_vec()));
+        // l1_match 无组 → 恒 true（粗筛不淘汰，L1 ⊇ L2 成立）
+        assert!(compiled.l1_match(b"this is a time.x log"));
+        assert!(compiled.l1_match(b"totally unrelated"));
     }
 
     #[test]
@@ -914,5 +1076,79 @@ mod tests {
             compiled.required_groups[0].is_pure_literal,
             "String 组应为纯字面量（Regex 组被跳过）"
         );
+    }
+
+    // --- verified_literals（v0.49 Opt A，Rust 方案 §7.9）---
+
+    fn verified_of(expr: &Expr) -> Vec<Vec<u8>> {
+        compile(expr).expect("编译应成功").verified_literals
+    }
+
+    #[test]
+    fn test_verified_literals_and_side_singleton() {
+        // "a" && cost>5 → a 是单元素纯字面量必选组成员 → 入集
+        let expr = Expr::And(
+            Box::new(expr_str("a")),
+            Box::new(expr_compare("cost", CmpOp::Gt, "5")),
+        );
+        assert_eq!(verified_of(&expr), vec![b"a".to_vec()]);
+    }
+
+    #[test]
+    fn test_verified_literals_or_group_not_singleton() {
+        // ("a" || "b") && cost>5 → Or 合组 [a,b] ≥2 元素 → 都不入集
+        let expr = Expr::And(
+            Box::new(Expr::Or(Box::new(expr_str("a")), Box::new(expr_str("b")))),
+            Box::new(expr_compare("cost", CmpOp::Gt, "5")),
+        );
+        assert!(verified_of(&expr).is_empty(), "Or 组成员不得入 verified");
+    }
+
+    #[test]
+    fn test_verified_literals_paren_and_trap() {
+        // "a" && ("b" && "c")：Paren(And) 组因 B14 完整性规则整组放弃
+        // → 只有 a 入集（朴素 And/Paren 路径规则会把 b/c 误标，健全性陷阱）
+        let expr = Expr::And(
+            Box::new(expr_str("a")),
+            Box::new(Expr::Prim(Prim::Paren(Box::new(Expr::And(
+                Box::new(expr_str("b")),
+                Box::new(expr_str("c")),
+            ))))),
+        );
+        assert_eq!(verified_of(&expr), vec![b"a".to_vec()]);
+    }
+
+    #[test]
+    fn test_verified_literals_not_side_excluded() {
+        // !("a") && "b"：Not 子树不下推 → a 不入集；b 入集
+        let expr = Expr::And(
+            Box::new(Expr::Not(Box::new(expr_str("a")))),
+            Box::new(expr_str("b")),
+        );
+        assert_eq!(verified_of(&expr), vec![b"b".to_vec()]);
+    }
+
+    #[test]
+    fn test_verified_literals_same_string_dominates() {
+        // "a" && ("a" || "b")：And 侧单元素组保证 a 存在 → a 入集
+        //（Or 侧同串节点豁免后恒 True，与 And 侧保证一致，Rust 方案 §7.9）
+        let expr = Expr::And(
+            Box::new(expr_str("a")),
+            Box::new(Expr::Prim(Prim::Paren(Box::new(Expr::Or(
+                Box::new(expr_str("a")),
+                Box::new(expr_str("b")),
+            ))))),
+        );
+        assert_eq!(
+            verified_of(&expr),
+            vec![b"a".to_vec()],
+            "And 侧单元素组成员应入集（可能重复）"
+        );
+    }
+
+    #[test]
+    fn test_verified_literals_pure_string_query() {
+        // 纯 "a"（无谓词）：单元素组 → 入集（虽然该查询本身走 l1_exact 捷径）
+        assert_eq!(verified_of(&expr_str("a")), vec![b"a".to_vec()]);
     }
 }

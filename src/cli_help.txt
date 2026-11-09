@@ -6,7 +6,7 @@ Pattern is ERE in BARE mode, DSL expression in gxp mode. Auto-detection:
 pattern containing `|` pipe, `&&`/`||`/`!` operators, or field predicates
 triggers gxp mode; otherwise BARE (ERE compat).
 
-Field predicates: cost_ms>800, _tag in [checkout,billing], cost_ms between 100 and 500, cost_ms exists
+Field predicates: cost_ms>800, level="ERROR" (string equality), _tag in [checkout,billing], cost_ms between 100 and 500, cost_ms exists
 
 Structural queries (L3 ast-grep, 9 langs: ts/rs/py/js/go/tsx/java/c/cpp):
   ast(LANG, "PATTERN")    — match AST nodes (e.g. ast(rs, "$OBJ.unwrap()") finds all .unwrap() calls)

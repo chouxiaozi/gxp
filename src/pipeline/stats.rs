@@ -306,7 +306,7 @@ mod tests {
         // 伪字段 _match/_line/_file 的值通常是字符串，无法数值解析 → 跳过 → N/A
         // 验证：伪字段仍走 pseudo_field_value 路径，但 parse_numeric_value 拒绝非数字
         let mut m1 = MatchedLine::new(1, b"ERROR abc");
-        m1.match_bytes = Some(b"ERROR".to_vec());
+        m1.match_bytes = Some(std::sync::Arc::from(b"ERROR".as_ref()));
         let summary = apply_stats(&[m1], b"_match");
         // _match = "ERROR"，parse_numeric_value 返回 None → 跳过 → N/A
         assert!(

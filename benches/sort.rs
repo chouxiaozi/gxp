@@ -7,7 +7,7 @@
 //! - `sort | head 20` vs `rank top 20`：sort+截断 vs partial-sort 的代价对比
 //!
 //! 验证点：
-//! - sort 在大命中集（300K+ 行）上是否成为 <80ms 全管道预算的瓶颈
+//! - sort 在大命中集（300K+ 行）上是否成为全管道预算的瓶颈（本机锚点 106.74ms，v0.49）
 //! - partial-sort（rank top 20）vs 全量 sort 的时间比应显著（4× 理论加速）
 //! - 整行字节序 vs 字段提取：字段提取（memchr + parse_numeric）额外开销
 //!

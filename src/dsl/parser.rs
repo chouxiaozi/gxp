@@ -436,8 +436,46 @@ fn prim(input: &str) -> IResult<&str, Prim> {
     if let Ok((rest, p)) = pred(input) {
         return Ok((rest, Prim::Pred(p)));
     }
+    // 5a. v0.48：`NAME <非等值操作符> "STRING"` 形态 fail-loud，不落 BARE 兜底。
+    // `level>"ERROR"` / `level!="ERROR"` 若落 BARE 会静默变成子串搜索（v0.42 静默吞
+    // 同类）。仅在 pred 失败后调用——REGEX/STRING/ast/capture 已在前面试过，
+    // 不会误伤 `/re>"x/` 这类正则字面量。定向 hint 由 mode 层 enrich（四段式模板）。
+    if quoted_wrong_op_shape(input) {
+        return Err(nom::Err::Error(NomError::new(
+            input,
+            nom::error::ErrorKind::Verify,
+        )));
+    }
     // 6. BARE 兜底（ERE 兼容，含空格匹配连续子串——但解析层只消费到下一个 `&&`/`||`/`|`/`)`）
     bare_literal(input).map(|(rest, b)| (rest, Prim::Bare(b)))
+}
+
+/// 检测 `NAME <op> "STRING"` 且 op 非等值（≠ `=` / `==`）的形态（v0.48 fail-loud）。
+///
+/// prim 的 pred 分支失败后调用：正常路径下 `=`/`==` 带引号 RHS 已被
+/// `pred_compare` 脱糖为 In，到达这里说明要么操作符非法，要么 STRING 畸形
+/// （如 `level=""` 空串——op 是 `=`，本函数返回 false，落 BARE 由 v0.42
+/// guard 兜底报错）。
+fn quoted_wrong_op_shape(input: &str) -> bool {
+    let t = input.trim_start();
+    // NAME：字母/数字/下划线（与 field_name 一致，允许前导 _ 伪字段）
+    let name_end = t
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .unwrap_or(t.len());
+    if name_end == 0 {
+        return false;
+    }
+    let after_name = t[name_end..].trim_start();
+    // 操作符（长度优先，双字符在前）
+    let Some(op) = ["!=", ">=", "<=", "==", ">", "<", "="]
+        .into_iter()
+        .find(|o| after_name.starts_with(o))
+    else {
+        return false;
+    };
+    let rest = after_name[op.len()..].trim_start();
+    // 带引号 RHS + 非等值操作符 → 误用形态
+    rest.starts_with('"') && op != "=" && op != "=="
 }
 
 /// `ast(NAME, STRING)` 解析（设计文档 §2.2 EBNF `ast` 规则）。
@@ -627,6 +665,14 @@ fn pred(input: &str) -> IResult<&str, Pred> {
     )))
 }
 
+/// 数值前瞻（粗筛，v0.48）：首字符数字/`-`/`+`/`.` 视为数值候选。
+/// 精确校验由编译期 D5 11 维契约做；误放行（如 `+x`）仍会被 D5 拒绝，fail-loud 不变。
+fn looks_numeric(v: &str) -> bool {
+    v.chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_digit() || c == '-' || c == '+' || c == '.')
+}
+
 fn pred_compare<'a>(name: &str, input: &'a str) -> IResult<&'a str, Pred> {
     // 按长度优先匹配 >=/<=/==/!=/>/<
     let (rest, op) = alt((
@@ -649,7 +695,39 @@ fn pred_compare<'a>(name: &str, input: &'a str) -> IResult<&'a str, Pred> {
         _ => unreachable!(),
     };
     let (rest, _) = multispace0(rest)?;
+    // v0.48 字符串等值脱糖（设计文档 §3.2）：`NAME ("="|"==") "STRING"` → 单元素 In。
+    // 构造性等价（同一 In 节点）——L1 下推 / Or 组完整性 / Not 豁免 / 伪字段 /
+    // captures 优先级全部继承 `in` 现有路径，零新增语义分支。
+    if matches!(op, CmpOp::Eq | CmpOp::Assign) && rest.starts_with('"') {
+        let (rest, s) = string_literal(rest)?;
+        return Ok((
+            rest,
+            Pred::In {
+                name: name.to_string(),
+                values: vec![s],
+            },
+        ));
+    }
+    // v0.48：非等值操作符 + 带引号 RHS → fail-loud（字符串无大小序；`!=` 的正确写法
+    // 是 `!(NAME="...")`）。返回 Err 后由 prim 的 shape guard 拦截（不落 BARE 兜底），
+    // 定向 hint 在 mode/gxp.rs::enrich_string_eq_hint 附加。
+    if rest.starts_with('"') {
+        return Err(nom::Err::Error(NomError::new(
+            input,
+            nom::error::ErrorKind::Verify,
+        )));
+    }
     let (rest, value) = pred_value(rest)?;
+    // v0.48：`=`（单等号）+ 无引号非数值 RHS → 返回 Err 落 BARE 兜底（ERE 字面量）。
+    // 设计文档 §2.2：`=` 不在 BARE 谓词分歧操作符列表（> < >= <= == !=），`a=b` 应与
+    // grep -E 一致；v0.47 实测却是 runtime 数值错误（文档-实现不一致，本处对齐）。
+    // `==` 是有意分歧操作符：非数值 RHS 保持 Compare（编译期 D5 拒绝），不走 BARE。
+    if matches!(op, CmpOp::Assign) && !looks_numeric(&value) {
+        return Err(nom::Err::Error(NomError::new(
+            input,
+            nom::error::ErrorKind::Verify,
+        )));
+    }
     Ok((
         rest,
         Pred::Compare {
@@ -743,6 +821,109 @@ mod tests {
         assert!(!is_bang_operator(Some(' '), Some('b')));
         // 空白前 + `(` 后 → 操作符
         assert!(is_bang_operator(Some(' '), Some('(')));
+    }
+
+    #[test]
+    fn test_parse_string_eq_desugar_single_element_in() {
+        // v0.48 字符串等值脱糖：level="ERROR" ≡ level in [ERROR]（设计文档 §3.2）
+        let q = parse_query(r#"level="ERROR""#).unwrap();
+        match q.expr {
+            Expr::Prim(Prim::Pred(Pred::In { name, values })) => {
+                assert_eq!(name, "level");
+                assert_eq!(values, vec!["ERROR".to_string()]);
+            }
+            other => panic!("期望单元素 In，得到 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_string_eq_double_equals_and_spaces() {
+        // == 同样接受带引号 RHS；STRING 允许空格（单一记号，强于 in 裸词列表）
+        let q = parse_query(r#"level == "WARN INFO""#).unwrap();
+        match q.expr {
+            Expr::Prim(Prim::Pred(Pred::In { name, values })) => {
+                assert_eq!(name, "level");
+                assert_eq!(values, vec!["WARN INFO".to_string()]);
+            }
+            other => panic!("期望单元素 In，得到 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_numeric_eq_unchanged() {
+        // 无引号数值：`=`/`==` 数值等值（D5 原样，v0.47 行为不变）
+        let q = parse_query("cost_ms=800").unwrap();
+        match q.expr {
+            Expr::Prim(Prim::Pred(Pred::Compare { name, op, value })) => {
+                assert_eq!(
+                    (name.as_str(), op, value.as_str()),
+                    ("cost_ms", CmpOp::Assign, "800")
+                );
+            }
+            other => panic!("期望 Compare，得到 {:?}", other),
+        }
+        let q = parse_query("cost_ms==800").unwrap();
+        match q.expr {
+            Expr::Prim(Prim::Pred(Pred::Compare { op, .. })) => assert_eq!(op, CmpOp::Eq),
+            other => panic!("期望 Compare，得到 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_single_eq_non_numeric_falls_back_to_bare() {
+        // v0.48：`=` 单等号非数值 RHS → BARE ERE 字面量（对齐设计文档分歧操作符列表）
+        let q = parse_query("a=b").unwrap();
+        match q.expr {
+            Expr::Prim(Prim::Bare(s)) => assert_eq!(s, "a=b"),
+            other => panic!("期望 BARE，得到 {:?}", other),
+        }
+        // `==` 是有意分歧操作符：非数值 RHS 保持 Compare（编译期 D5 拒绝）
+        let q = parse_query("a==b").unwrap();
+        match q.expr {
+            Expr::Prim(Prim::Pred(Pred::Compare { op, value, .. })) => {
+                assert_eq!(op, CmpOp::Eq);
+                assert_eq!(value, "b");
+            }
+            other => panic!("期望 Compare，得到 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_quoted_rhs_wrong_op_fails_loud() {
+        // 带引号 RHS + 非等值操作符 → 解析失败（不落 BARE 兜底）
+        assert!(parse_query(r#"level>"ERROR""#).is_err());
+        assert!(parse_query(r#"level!="ERROR""#).is_err());
+        assert!(parse_query(r#"level >= "x""#).is_err());
+        // 合法对照（不应误伤）
+        assert!(parse_query(r#"level="ERROR""#).is_ok());
+        assert!(parse_query(r#"level=="ERROR""#).is_ok());
+    }
+
+    #[test]
+    fn test_parse_string_eq_in_bool_context() {
+        // && / Not 上下文中的字符串等值（§3.4 D6：作用于 pred 必须括号）
+        let q = parse_query(r#""timeout" && level="ERROR""#).unwrap();
+        match q.expr {
+            Expr::And(_, rhs) => {
+                assert!(matches!(*rhs, Expr::Prim(Prim::Pred(Pred::In { .. }))));
+            }
+            other => panic!("期望 And，得到 {:?}", other),
+        }
+        let q = parse_query(r#"!(level="ERROR")"#).unwrap();
+        match q.expr {
+            // `!(...)` 的 prim 是 Paren 包裹（§3.4：! 作用于 pred 必须用括号）
+            Expr::Not(inner) => match *inner {
+                Expr::Prim(Prim::Paren(inner2)) => {
+                    assert!(
+                        matches!(*inner2, Expr::Prim(Prim::Pred(Pred::In { .. }))),
+                        "Paren 内应为 In：{:?}",
+                        inner2
+                    );
+                }
+                other2 => panic!("期望 Paren 包裹，得到 {:?}", other2),
+            },
+            other => panic!("期望 Not，得到 {:?}", other),
+        }
     }
 
     #[test]

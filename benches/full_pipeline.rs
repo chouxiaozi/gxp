@@ -1,4 +1,4 @@
-//! 全管道基准（对齐 §7.1 v1 性能目标：< 80ms）。
+//! 全管道基准（对齐 §7.1 基线锚点：本机 106.74ms = v0.49 diag median，劣化 >10% 需归因）。
 //!
 //! 合成 44MB 日志，查询：
 //! `"timeout" && _tag in [checkout,billing] && cost_ms>800 | rank top 20 by cost_ms desc | fields _ts,_tag,cost_ms`
@@ -20,7 +20,7 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use gxp::cli::RunOpts;
 use gxp::mode::detect::run_with_writer;
 
-/// 合成语料大小：~44MB（对齐 §7.1 v1 目标）。
+/// 合成语料大小：~44MB（对齐 §7.1 指标口径）。
 const CORPUS_BYTES: usize = 44 * 1024 * 1024;
 
 /// fixtures 路径（与 l1_scan.rs 共享同一份 44mb.log）。

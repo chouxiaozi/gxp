@@ -13,6 +13,7 @@
 //! 管道动词（`|`）→ [`crate::pipeline::execute_stages`] 执行链。
 
 use std::path::Path;
+use std::sync::Arc;
 
 use rayon::prelude::*;
 
@@ -30,12 +31,34 @@ use crate::pipeline::execute_stages_streaming;
 ///
 /// `run_gxp_mode_directory` / `run_gxp_mode_with_content` 均需先 parse 再 compile，
 /// 错误映射一致（Parse → `GxpError::Parse`，编译失败 → `GxpError::Runtime`）。
+/// v0.48（③b hint）：解析失败且查询含 `NAME <非等值操作符> "STRING"` 形态时，
+/// 在 Parse 错误 detail 上附加定向 hint（`level>"ERROR"` / `level!="ERROR"` 类误写）。
+///
+/// 宽松扫描（`has_quoted_wrong_op`）只影响错误文案；语义拦截在 parser 层
+/// （`quoted_wrong_op_shape` fail-loud，不落 BARE 兜底）。
+fn enrich_string_eq_hint(pattern: &str, e: crate::GxpError) -> crate::GxpError {
+    if !crate::mode::detect::has_quoted_wrong_op(pattern) {
+        return e;
+    }
+    let crate::GxpError::Parse { detail } = e else {
+        return e;
+    };
+    crate::GxpError::Parse {
+        detail: format!(
+            "{detail}\nhint: 双引号 RHS（字符串值）只支持等值操作符 `=` / `==`：\n  \
+             - 字符串等值：level=\"ERROR\"（≡ level in [ERROR]）\n  \
+             - 不等值：!(level=\"ERROR\")（D6 强制括号）\n  \
+             - 数值比较请去引号（D5 11 维契约）：cost_ms>800"
+        ),
+    }
+}
+
 pub(crate) fn parse_and_compile(
     pattern: &str,
 ) -> crate::Result<(crate::dsl::ast::Query, crate::l1::compiler::CompiledL1)> {
     // parse_query 已返回 GxpError::Parse（detail 不含 "gxp: error: parse:" 前缀，
     // 前缀由 error.rs Display 模板加一次）。直接透传避免双重前缀。
-    let q = parse_query(pattern)?;
+    let q = parse_query(pattern).map_err(|e| enrich_string_eq_hint(pattern, e))?;
     // v0.42 修复：gxp 模式静默吞未闭合字段谓词 bug。
     // `is_gxp_mode=true` 表示用户意图 gxp DSL（含 ` in [`/` between `/`(`/`&&`/`||`/`!`），
     // 但 parse_query 的 prim() 失败时 fall through 到 BARE 兜底，导致 `_tag in [a, b`
@@ -131,8 +154,9 @@ pub(crate) fn run_gxp_mode_with_content<W: std::io::Write>(
     }
 
     // L2 预编译 + L3 预计算（DRY：PreparedScan::build 统一封装）
+    // verified_literals：L1 已保证存在的字面量 → L2 豁免重校验（v0.49 Opt A）
     let file_ext = crate::mode::detect::ext_from_path(file_path);
-    let scan = PreparedScan::build(&q.expr, bytes, &file_ext)?;
+    let scan = PreparedScan::build(&q.expr, bytes, &file_ext, &compiled.verified_literals)?;
 
     // --strict：字段探活（设计文档 §2.4 示例 5）
     // 查询引用的字段名在输入中从未出现 → fail-loud 报错
@@ -145,10 +169,11 @@ pub(crate) fn run_gxp_mode_with_content<W: std::io::Write>(
 
     // 单文件模式填充 path（与流式路径同构：与 execute_stages 入口对齐，
     // 供 `_file` 伪字段提取；文本输出由 emit_remaining show_path_prefix=false 抑制前缀）
-    let normalized_path = file_path.replace('\\', "/");
+    // Opt C：一次 Arc 构造，逐行 refcount clone（原每行 String 堆分配 ~6.5ms/44MB）
+    let normalized_path: Arc<str> = Arc::from(file_path.replace('\\', "/").as_str());
     for m in &mut matched {
         if m.path.is_none() {
-            m.path = Some(normalized_path.clone());
+            m.path = Some(Arc::clone(&normalized_path));
         }
     }
 
@@ -208,7 +233,7 @@ fn run_gxp_mode_streaming<W: std::io::Write>(
 
     // L2 预编译（L3 不支持流式，scan_and_collect_stream 会报错）
     let file_ext = crate::mode::detect::ext_from_path(file_path);
-    let scan = PreparedScan::build(&q.expr, &[], &file_ext)?;
+    let scan = PreparedScan::build(&q.expr, &[], &file_ext, &compiled.verified_literals)?;
 
     // 流式 L1 扫描 + L2 精判 → Vec<MatchedLine>
     let mut matched = scan_and_collect_stream(&compiled, &scan, path)?;
@@ -216,10 +241,11 @@ fn run_gxp_mode_streaming<W: std::io::Write>(
     // 流式单文件也填充 path（：与 execute_stages 入口对齐）
     // 之前只在 opts.json=true 时填，文本模式漏填 →
     // `group by _file` / `distinct by _file` 大文件流式返回空键
-    let normalized_path = file_path.replace('\\', "/");
+    // Opt C：Arc 共享（与 run_gxp_mode_with_content 同构）
+    let normalized_path: Arc<str> = Arc::from(file_path.replace('\\', "/").as_str());
     for m in &mut matched {
         if m.path.is_none() {
-            m.path = Some(normalized_path.clone());
+            m.path = Some(Arc::clone(&normalized_path));
         }
     }
 
@@ -273,7 +299,7 @@ pub(crate) fn run_gxp_mode_directory<W: std::io::Write>(
 
     // L2 预编译（顶层算一次，每文件复用 prepared；ast_lines 每文件单独算）
     // 顶层 build 无文件路径 → file_ext="" → 不做扩展名过滤（每文件 build_per_file 再过滤）
-    let scan = PreparedScan::build(&q.expr, &[], "")?;
+    let scan = PreparedScan::build(&q.expr, &[], "", &compiled.verified_literals)?;
 
     // --strict：字段探活（设计文档 §2.4 示例 5）
     // 目录模式：逐文件读入 → strict_field_probe 跨文件并集检测（DRY：与单文件统一）
@@ -385,4 +411,46 @@ pub(crate) fn run_gxp_mode_directory<W: std::io::Write>(
     }
 
     crate::pipeline::execute_stages_directory(&q.stages, vec_inputs, out, opts.json)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_enrich_string_eq_hint_appends_on_wrong_op() {
+        let base = crate::GxpError::Parse {
+            detail: "DSL 解析失败".to_string(),
+        };
+        let enriched = enrich_string_eq_hint(r#"level>"ERROR""#, base);
+        let crate::GxpError::Parse { detail } = enriched else {
+            panic!("期望 Parse")
+        };
+        assert!(detail.contains("DSL 解析失败"), "应保留原 detail：{detail}");
+        assert!(detail.contains("level=\"ERROR\""), "应含等值写法：{detail}");
+        assert!(
+            detail.contains("!(level=\"ERROR\")"),
+            "应含否定写法：{detail}"
+        );
+    }
+
+    #[test]
+    fn test_enrich_string_eq_hint_noop_on_legal_or_other_error() {
+        // 合法脱糖形态：不加 hint
+        let base = crate::GxpError::Parse {
+            detail: "x".to_string(),
+        };
+        match enrich_string_eq_hint(r#"level="ERROR""#, base) {
+            crate::GxpError::Parse { detail } => assert_eq!(detail, "x"),
+            _ => panic!("期望 Parse"),
+        }
+        // 非 Parse 错误：原样返回
+        let runtime = crate::GxpError::Runtime {
+            detail: "r".to_string(),
+        };
+        assert!(matches!(
+            enrich_string_eq_hint(r#"level>"ERROR""#, runtime),
+            crate::GxpError::Runtime { .. }
+        ));
+    }
 }
