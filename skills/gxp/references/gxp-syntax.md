@@ -13,6 +13,8 @@ gxp 'a|b' app.log                            # ERE 的 OR
 
 **不支持 grep 短选项**（D1 硬约束）：`-A`/`-B`/`-C`/`-e`/`-i`/`-v`/`-o`/`-l`/`-L`/`-c`/`-w`/`-x`/`-n`/`-h`/`-r`/`--color`/`-q`/`-s`。等价功能走 gxp 原生语法。
 
+**纯 stage 查询会被 BARE 模式吞掉**：查询只含管道动词（如 `distinct by trace_id`、`count`）时被判为 BARE 模式，当成 ERE 字面量去搜文件（0 命中、退出码 1）——**谓词先行**：`trace_id exists | distinct by trace_id`、`"ERROR" | count`。
+
 ## gxp DSL 谓词
 
 | 类别 | 语法 | 示例 |

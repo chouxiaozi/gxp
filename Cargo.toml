@@ -4,7 +4,17 @@ version = "0.49.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "grep-aligned query language for LLM agents (not a strict superset)"
-rust-version = "1.75"
+repository = "https://github.com/cianlabs/gxp"
+homepage = "https://github.com/cianlabs/gxp"
+readme = "README.md"
+keywords = ["grep", "cli", "search", "logging", "llm"]
+categories = ["command-line-utilities", "text-processing"]
+rust-version = "1.90"
+
+# cargo-udeps 误报豁免：以下为 optional 依赖（ripgrep-engine / simd-json feature），
+# 未启用对应 feature 时 udeps 报"未用"属已知误报（udeps 自身文档建议 metadata.ignore）
+[package.metadata.cargo-udeps.ignore]
+normal = ["grep-matcher", "grep-regex", "grep-searcher", "simd-json"]
 
 [lib]
 name = "gxp"
@@ -63,7 +73,10 @@ tempfile = "3.10"
 memmap2 = "0.9"          # 降为 dev-dependency，仅 diag_mmap.rs 对照基准使用
 
 [features]
-default = []
+# 2026-11-10 crates.io 首发决策：默认开 l3-structural（AST 查询）——与预编译二进制
+# "全功能开箱即用"一致，避免 cargo install 后 ast() 不可用的体验断裂；代价是首次
+# 编译拉 tree-sitter 全家桶（约 +2~3 分钟）。裁剪走 --no-default-features。
+default = ["l3-structural"]
 ripgrep-engine = ["dep:grep-searcher", "dep:grep-regex", "dep:grep-matcher"]
 simd-json = ["dep:simd-json"]
 # l3-structural 不直接依赖 tree-sitter（ast-grep-core 自带 0.26），避免 links 冲突

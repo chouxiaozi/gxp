@@ -477,15 +477,15 @@ gxp **不是 grep 的严格超集**（D1），不接受 grep 短选项参数。�
 
 | # | 功能 | 场景 | 不变式 | 等级 |
 |---|---|---|---|---|
-| ~~1~~ | ~~`sample N`/`sample RATIO`~~ ✅ v0.33 落地 | LLM context window 物理限制 | 无 | ~~L2~~ |
-| ~~2~~ | ~~多行 stack trace~~ ✅ v0.39 落地 | 异常分析当前只抓首行 | L1 不变（pipeline 阶段判定续行边界） | ~~L0~~ |
-| ~~3~~ | ~~`distinct` 去重投影~~ ✅ v0.35 落地 | 唯一 user_id/error_code（与 group by 语义区分：行列表 vs 计数） | 无 | ~~L2~~ |
-| ~~4~~ | ~~多行 JSON 合并~~ | re-triage 后转暂不评估（2026-10-26） | — | ~~L0→暂不评估~~ |
+| 1 | `sample N`/`sample RATIO` ✅ v0.33 落地 | LLM context window 物理限制 | 无 | L2 |
+| 2 | 多行 stack trace ✅ v0.39 落地 | 异常分析当前只抓首行 | L1 不变（pipeline 阶段判定续行边界） | L0 |
+| 3 | `distinct` 去重投影 ✅ v0.35 落地 | 唯一 user_id/error_code（与 group by 语义区分：行列表 vs 计数） | 无 | L2 |
+| 4 | 多行 JSON 合并 | re-triage 后转暂不评估（2026-10-26） | — | L0 → 暂不评估 |
+| 5 | `sort [by FIELD] [desc\|asc]` ✅ v0.34 落地 | rank top-K 外的全量有序 | 无 | L2 |
+| 6 | `percentiles FIELD [p50,p95,p99]` ✅ v0.37 落地 | SLO 报告核心指标；avg 掩盖长尾 | 非流式（与 sort 一致） | L2 |
+| 7 | `--json` 单文件 path 字段 ✅ v0.36 落地 | search→edit 自包含；schema 与目录一致 | 无 | L1 |
 
 > **候选 #4 re-triage 决策（2026-10-26）**：候选 #4 起源是 2026-10-22 某低代码平台 代码库评估副产品（场景 B），场景 B 在 v0.40 修正 §8.2 判决理由后独立出去（需 preprocessor 概念，与 Vue SFC 同类）。剩余场景 A（pretty-printed JSON 日志合并）是事后补的合理化场景，不是真实 LLM 工作流驱动需求——违反 §0.1 第 1 条场景驱动原则。场景频率评估：K8s/Docker 生产日志默认单行 JSONL（不是多行），配置文件 LLM 通常直接 Read，多行 JSON 在真实 LLM 工作流中稀疏。替代路径：`jq -c '.' multiline.log | gxp 'cost_ms>500'`。详见 §11.3.2 暂不评估清单。
-| ~~5~~ | ~~`sort [by FIELD] [desc\|asc]`~~ ✅ v0.34 落地 | rank top-K 外的全量有序 | 无 | ~~L2~~ |
-| ~~6~~ | ~~`percentiles FIELD [p50,p95,p99]`~~ ✅ v0.37 落地 | SLO 报告核心指标；avg 掩盖长尾 | 非流式（与 sort 一致） | ~~L2~~ |
-| ~~7~~ | ~~`--json` 单文件 path 字段~~ ✅ v0.36 落地 | search→edit 自包含；schema 与目录一致 | 无 | ~~L1~~ |
 
 #### 11.3.2 暂不评估清单 + re-triage（2026-10-26，场景驱动）
 
@@ -506,8 +506,9 @@ gxp **不是 grep 的严格超集**（D1），不接受 grep 短选项参数。�
 | 多行 JSON 合并（原候选 #4） | 弱（K8s/Docker 生产日志默认单行 JSONL；配置文件 LLM 直接 Read；多行 JSON 在真实 LLM 工作流稀疏） | 无（方案 c：L4 合并与 trace 同构；方案 b：L2 改造风险中） | `jq -c '.' multiline.log \| gxp 'cost_ms>500'`（jq 预处理转单行 JSONL） | **仍保持暂不评估**：re-triage 后从候选 #4 转入。起源是 2026-10-22 某低代码平台 评估副产品，场景 A 是事后合理化，不是真实 LLM 工作流驱动需求（违反 §0.1 第 1 条）。升级条件：用户明确报告多行 JSON 日志场景频繁 + jq 预处理负担重 |
 | `--verify-large` 分块 verify | 弱（>512MB 单文件 --verify 拒绝场景，但 --verify 是 gxp 开发者不变式校验，非 LLM agent 工作流驱动） | 中（边界跨行处理：context N / trace 续行跨块易出 bug；run_verify 暴力路径 Vec<(usize, Vec<u8>)> 全量命中行 clone 内存模型不变） | 用户 `split -C 500M bigfile.log chunk_` + 逐块 `gxp 'pattern' chunk_* --verify`；或 `head -c 500M bigfile.log \| gxp 'pattern' /dev/stdin --verify` | **仍保持暂不评估**（v0.42 评估，2026-10-27）：§0.1 第 1 条场景驱动不通过（非 LLM agent 工作流）+ 第 4 条等价组合替代已存在（用户 split 即可）。升级条件：用户报告 split 语法负担重 + 频繁需要 >512MB 单文件 verify |
 | 流式性能三件套（性能项，非功能）：#1 块式流式扫描（8MB 块 + 块内 `scan_lines_cb` + 跨块行 carry，替代 `read_until` 逐行）/ #2 聚合 stage 免收集（count/files/stats 命中即计数，跳过 MatchedLine 构造）/ #3 单字面量 AC→memmem 特化 | 中（流式仅 >512MB 单文件触发，场景 A/D 大文件变体；P2 实测本机流式 ~790 MiB/s 慢于 rg ~1.9 GiB/s 达 2.4×，perf-baseline §1.3.2；但 P2 诚实结论"gxp 价值不在裸吞吐"——排期应取决于 P3 agent A/B 实验是否要求大文件吞吐竞争力） | #1 低（语义不变，块边界/CRLF/末行语义已有测试锚定）；#2 中（B1 终止 stage 语义 + §6.4 组合矩阵需 e2e）；#3 低（L1 编译期特化，`L1 ⊇ L2` 不变） | 无等价组合（性能优化）；用户侧缓解 = 数据源头分卷（同 `--verify-large` 行的 split 思路） | **暂不评估**（2026-11-09 记录，P2 副产品）：预期收益为推算非承诺——#1 估 1137→850-950ms、#+2 估→650-800ms（900MB count 口径，反超 grep 但仍慢 rg ~1.4×，残余差距是专用扫描器护城河）。升级条件：P3 agent A/B 结论要求大文件场景竞争力，或用户报告 >512MB 单文件查询频繁且延迟不可接受 |
+| DRY 重复率整改（重构项，非功能） | 无（代码质量项，不对应 LLM 工作流场景） | 中（热点是 §6.5.3 同构镜像的受控结构：dir/index.rs↔plan.rs 双遍历 12 处 / pipeline/count.rs 8 / mode/eval.rs captures 双镜像 8 / mode 三路径——B8/B9 同构遗漏史证明镜像一致性靠纪律维护，贸然合并反而放大不变式风险） | jscpd threshold 7 防恶化门禁（scripts/check-dry.sh + ci.yml 调用，本地可复现；jscpd 5.x 参数陷阱——--exit-code 是"发现即退"独立开关会覆盖 --threshold 判定，2026-11-09 修复时抽脚本固化） | **仍保持暂不评估**（2026-11-09 CI 首次真实运行）：基线 lines 6.09%（判定口径）/ 182 clones（src 5.34%/93 + tests 6.39%/76 + 跨目录 13，min-tokens 50）。tests 重复是对照断言/夹具模板属可接受；src 重复主体是同构镜像 + `#[cfg(test)]` 内联夹具。升级条件：CI 红线（lines 超 7%）或内联测试外迁（§6.6 e2e 约束）顺带消化 |
 
-**re-triage 结论**：16 项中 2 项永久拒绝（T2/T3、SIMD JSON 强制启用，均因 D 系硬约束根本冲突），14 项仍保持暂不评估（含 v0.42 评估新增的 `--verify-large` + 2026-11-09 新增的流式性能三件套，后者为性能项非功能项）。无升级为候选。判据核心是 §0.1 场景驱动 + D 系硬约束根本冲突检查。
+**re-triage 结论**：17 项中 2 项永久拒绝（T2/T3、SIMD JSON 强制启用，均因 D 系硬约束根本冲突），15 项仍保持暂不评估（含 v0.42 评估新增的 `--verify-large` + 2026-11-09 新增的流式性能三件套与 DRY 重复率整改，后两者为性能/质量项非功能项）。无升级为候选。判据核心是 §0.1 场景驱动 + D 系硬约束根本冲突检查。
 
 ---
 

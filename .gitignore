@@ -24,9 +24,8 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 
-# === 测试与基准产物 ===
-fixtures/44mb.log
-fixtures/*.log
+# === 测试与基准产物（fixtures/ 整目录本地产物不入库，AGENTS §1）===
+/fixtures/
 coverage/
 tarpaulin-report.html
 criterion/
@@ -36,9 +35,3 @@ target/criterion/
 *.bak
 *.tmp
 *.log.tmp
-.cac/
-
-# === 分发用二进制（由 scripts/package.sh 生成，不入库）===
-# dist/skill/bin/*.exe 是 cargo build 产物，每次 build diff 巨大且无意义
-# 准备分发时跑 scripts/package.sh 重新生成
-dist/skill/bin/

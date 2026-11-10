@@ -36,7 +36,7 @@
 | `rustfmt.toml` | 锁 edition 2021 | v1 挂；rustfmt 升级时重评估 |
 | pre-commit | fmt + clippy（含 `--all-features`） | v1 挂；团队协作后可加 commit-msg |
 | CI 阻断 | fmt + clippy + test（均 `--all-features`）+ doc + all-features + cargo-deny | v1 挂；matrix 后加 ubuntu/macos |
-| CI 非阻断 info | MSRV (1.75) / DRY (jscpd) / 覆盖率 (llvm-cov) / 变异 (cargo-mutants) | v1 挂为 info-only；L1/L2 实现完后设阈值转阻断 |
+| CI 非阻断 info | MSRV (1.90) / DRY (jscpd) / 覆盖率 (llvm-cov) / 变异 (cargo-mutants，周定时) | v1 挂为 info-only；L1/L2 实现完后设阈值转阻断 |
 | `xtask` 模式 | 统一本地/CI 命令 | v2 评估（当前 PowerShell 够用） |
 
 **修改门禁时**：

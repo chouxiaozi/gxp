@@ -65,16 +65,20 @@ gxp 面向 LLM agent。特性取舍判据：场景驱动 + 输出自包含 + 不
 
 ## 1. 目录结构
 
-**根目录约束**：根目录只放 `AGENTS.md`、`.gitignore`、`Cargo.toml` 以及顶层目录（`docs/`/`src/`/`tests/`/`benches/`）。
+**根目录约束**：根文件 = `AGENTS.md`/`.gitignore`/`Cargo.toml`/`Cargo.lock`/`CONTRIBUTING.md`/`README.md`/`LICENSE-MIT`/`LICENSE-APACHE`/`install.sh`；顶层目录 = `docs/`/`src/`/`tests/`/`benches/`/`scripts/`/`skills/`/`.github/`/`.claude-plugin/`（`fixtures/` 为本地产物不入库）。
 
 ```
 gxp/
-├── AGENTS.md / .gitignore / Cargo.toml / CONTRIBUTING.md
+├── AGENTS.md / .gitignore / Cargo.toml / CONTRIBUTING.md / README.md / LICENSE-* / install.sh
+├── .claude-plugin/  # marketplace.json + plugin.json（repo 根即 plugin：/plugin install gxp --marketplace cianlabs/gxp）
 ├── docs/     # design-full + rust-implementation-plan + changelog + capability-matrix + performance-baseline
 ├── src/      # main/lib/cli/error/plan + dsl/ + mode/ + l1/ + l2/ + l3/ + dir/ + io/ + pipeline/
-├── tests/    # cli_{bare,pipeline,directory,ast,stdin,glob}.rs + dir_*.rs + dsl_parser + l1_scan + l2_extract + numeric_eval + common
+├── skills/   # gxp skill 单一权威源（SKILL.md + references/；plugin / skills.sh / release zip 三出口同源）
+├── tests/    # cli_{bare,pipeline,directory,ast,stdin,glob,readme_examples}.rs + dir_*.rs + dsl_parser + l1_scan + l2_extract + numeric_eval + common
 └── benches/  # l1_scan / l2_extract / full_pipeline / scale_dir + diag_*
 ```
+
+> skill 分发资产门禁：`sh scripts/check_plugin.sh`（claude plugin validate + SKILL.md 结构 + skills.sh 发现；CI plugin-lint job 同口径）。
 
 > 实现语言：Rust（v0.1 起唯一实现，决策记录见 changelog v0.1）。
 
@@ -296,7 +300,7 @@ gxp/
 | `sample N`（44MB，N=20..10000） | <1ms 洗牌开销 |
 | DirIndex lax 二次（Linux） | 0.15ms |
 
-> **门禁口径（v0.49 重锚定，2026-11-09 用户确认）**：后续版本同机 A/B 实测（diag median of 3），median 劣化 >10% 需归因；跨机绝对值不可比（比值 1.52-1.85×）。旧机 80/30/20ms 目标（i7-14700，v0.32-v0.45）降为历史参考（perf-baseline §1.1 机器变更说明）。实测数据权威源 `docs/performance-baseline.md` §1.1-1.2（44MB）+ §1.3（12GB 大数据多轮）。Windows `FindFirstFile` 单次 ~60µs（Linux 5-10×），物理上不可能达 0.15ms。Linux 接入按 CI 节奏推进，不门控。vs GNU grep 对比数据见 perf-baseline §1.3.2（911MB 单文件 gxp 2.42× 快于 GNU grep 3.0）。详见 Rust 方案 §11.5.4。
+> **门禁口径（v0.49 重锚定，2026-11-09 用户确认）**：后续版本同机 A/B 实测（diag median of 3），median 劣化 >10% 需归因；跨机绝对值不可比（比值 1.52-1.85×）。旧机 80/30/20ms 目标（i7-14700，v0.32-v0.45）降为历史参考（perf-baseline §1.1 机器变更说明）。实测数据权威源 `docs/performance-baseline.md` §1.1-1.2（44MB）+ §1.3（12GB 大数据多轮）。Windows `FindFirstFile` 单次 ~60µs（Linux 5-10×），物理上不可能达 0.15ms。Linux 接入按 CI 节奏推进，不门控。vs GNU grep/ripgrep 三方对照见 perf-baseline §1.3.2（本机 900MB count：rg 575ms < grep 1024ms < gxp 1454ms，gxp 裸扫最慢，赢面在 agent 往返与输出自包含；旧机 911MB v0.42 曾 2.42× 快于 grep，跨机不可比）。详见 Rust 方案 §11.5.4。
 
 **内存/依赖**：零持久索引（D10 + 统一 `read_to_end` + thread-local buffer 复用）；不引入新 crate（Rust 方案 §13 列出）；不 fork；license MIT OR Apache-2.0
 

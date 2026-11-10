@@ -662,7 +662,7 @@ Python, JavaScript, TypeScript, Go, Rust, Java, C, C++, C#, Ruby, PHP, Bash, SQL
 
 - gxp L3 定位为**行级 AST 扇出调度器**：L1 粗筛出候选文件 → `L3Matcher::match_file` → 行号集合 → 进 pipeline（rank/fields/context）。不做跨文件符号解析、调用图、依赖爆炸半径——这是 codebase-mcp 的领域。
 - codebase-mcp 定位为**预建索引的代码理解工具**：跨查询复用 AST 索引，提供符号级 + 调用图能力。
-- LLM agent 工具路由：按返回形式选择——要行号 + 字段/数值/Top-K 走 gxp；要符号定义源码 + 调用路径走 codebase-mcp。路由由 agent harness（如 CodeAgent tool descriptor）完成，gxp 核心不内嵌 MCP server（D9 + §15 决策表"不做 MCP server，外围封装才做"）。
+- LLM agent 工具路由：按返回形式选择——要行号 + 字段/数值/Top-K 走 gxp；要符号定义源码 + 调用路径走 codebase-mcp。路由由 agent harness（如 Claude Code 的 tool 定义）完成，gxp 核心不内嵌 MCP server（D9 + §15 决策表"不做 MCP server，外围封装才做"）。
 - **gxp 核心聚焦能力**：行级检索 + 字段抽取 + 数值比较 + Top-K 投影 + L3 行级 AST 扇出。MCP/agent harness 集成属外围封装，不进 gxp 仓库；v2 若有 MCP 需求，落地形式是独立子项目（如 `gxp-mcp` crate）。
 
 ---

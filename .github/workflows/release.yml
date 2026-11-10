@@ -1,0 +1,220 @@
+# gxp Release 流水线 — tag 触发多平台构建 + GitHub Release 工件 + crates.io 发布
+#
+# 触发：push tag v*
+# 工件：4 平台预编译二进制（含 l3-structural，全功能开箱即用）
+#   - x86_64-unknown-linux-gnu   (ubuntu-latest 原生)
+#   - x86_64-pc-windows-msvc     (windows-latest 原生；CI 门禁矩阵同 host 已验证)
+#   - aarch64-apple-darwin       (macos-latest = arm64 原生)
+#   - x86_64-apple-darwin        (ARM runner 交叉编译，macos-13 已退役)
+# 另：publish-crate job 自动发布 crates.io（幂等：已发布版本自动跳过）
+#
+# 注意：性能基线锚点（AGENTS.md §7.1）是本机同机 A/B 口径，GitHub runner
+# 机器抖动大，release 构建不跑 bench 门禁（bench 保持本地纪律）。
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04  # 锁定：产物 glibc 口径稳定（ubuntu-latest 已开始向 26.04 滚动，glibc 更新会收窄预编译包兼容面，runner-images#14748）
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          # Intel runner（macos-13）免费队列长期拥堵（曾排队 1.5h+ 无法出 Release），
+          # 改 ARM runner 交叉编译：Apple clang/SDK 原生双架构（-arch x86_64），
+          # cc crate 自动跟随 --target 传 arch，产物与 Intel 原生编译功能等价
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive: tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: cargo build --release
+        run: cargo build --release --locked --features l3-structural --target ${{ matrix.target }}
+
+      - name: Verify binary arch (unix)
+        if: matrix.archive == 'tar.gz'
+        run: |
+          f="target/${{ matrix.target }}/release/gxp"
+          file "$f"
+          case "${{ matrix.target }}" in
+            aarch64-apple-darwin)     file "$f" | grep -q "arm64" ;;
+            x86_64-apple-darwin)      file "$f" | grep -q "x86_64" ;;
+            x86_64-unknown-linux-gnu) file "$f" | grep -q "ELF 64-bit" ;;
+          esac
+
+      - name: Package (unix)
+        if: matrix.archive == 'tar.gz'
+        run: |
+          dir="gxp-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir -p "$dir"
+          cp "target/${{ matrix.target }}/release/gxp" "$dir/"
+          cp README.md LICENSE-MIT LICENSE-APACHE "$dir/"
+          tar -czf "$dir.tar.gz" "$dir"
+          sha256sum "$dir.tar.gz" > "$dir.tar.gz.sha256"
+
+      - name: Package (windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $dir = "gxp-${{ github.ref_name }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/gxp.exe" $dir/
+          Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE $dir/
+          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+          $hash = (Get-FileHash "$dir.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $dir.zip" | Out-File "$dir.zip.sha256" -Encoding ascii
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: gxp-${{ matrix.target }}
+          path: gxp-*-${{ matrix.target }}.*
+
+  skill-package:
+    name: package skill bundle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: zip skill text bundle
+        run: |
+          cd skills/gxp
+          zip -r "../../gxp-skill-${{ github.ref_name }}.zip" SKILL.md FEEDBACK.md references
+          # zip 内容断言：根级 SKILL.md 必在；退役条目（INSTALL.md/scripts）不得回流
+          # ⚠️ 禁管道接判定（CI 脚本红线）——用重定向 + grep 文件
+          unzip -l "../../gxp-skill-${{ github.ref_name }}.zip" > /tmp/ziplist.txt
+          grep -q " SKILL.md" /tmp/ziplist.txt || { echo "zip missing root SKILL.md" >&2; exit 1; }
+          if grep -Eq "INSTALL\.md|scripts/" /tmp/ziplist.txt; then
+            echo "zip contains retired entries (INSTALL.md/scripts)" >&2; exit 1
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: gxp-skill
+          path: gxp-skill-*.zip
+
+  release:
+    name: GitHub Release
+    needs: [build, skill-package]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist-artifacts
+          merge-multiple: true
+
+      - name: Reset release for idempotent re-runs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 同 tag 重跑（tag 同移强推）时 generate_release_notes 会向既有 body
+          # 追加而非替换——v0.49.0 曾实测多段 Full Changelog 堆叠（含迁移前
+          # 旧 org 地址）。根治：先删旧 release 干净重建（tag 本体不动，
+          # 不用 --cleanup-tag），资产由下一步重传。
+          # ⚠️ 本 job 无 checkout 步骤——gh 必须显式 --repo（否则无 git 上下文，
+          # view 失败被 if 判"不存在"静默跳过，实测踩坑）。
+          TAG="${{ github.ref_name }}"
+          REPO="${GITHUB_REPOSITORY}"
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release delete "$TAG" --repo "$REPO" --yes
+            echo "deleted existing release $TAG for clean recreate"
+          fi
+
+      - name: Create release with assets
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist-artifacts/*
+          generate_release_notes: true
+
+  publish-crate:
+    # crates.io 自动发布（与二进制 Release 并行，互不阻塞）。
+    # token 生命周期：crates.io/settings/tokens 生成（勾 publish-new）→ 本机 cargo login
+    # → gh secret set CARGO_REGISTRY_TOKEN。token 失效表现为自检步骤 fail-loud（404/401）。
+    name: publish crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: publish-crate
+
+      - name: Verify registry token
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          # fail-loud 自检：token 无效在此暴露。⚠️ 不能用 crates.io /users/me 验证——
+          # publish-new 细粒度 scope 不覆盖 read-profile 端点（有效 token 也 404，实测踩坑）。
+          # cargo owner --list 走真实认证层：401/403 = token 坏；404 crate-does-not-exist =
+          # 认证通过（gxp 首发前的预期状态）；成功列出 owner = 已发布版本。
+          set +e
+          OUT="$(cargo owner --list gxp 2>&1)"
+          set -e
+          if printf '%s' "$OUT" | grep -qiE 'status 40[13]|unauthorized'; then
+            echo "CARGO_REGISTRY_TOKEN rejected by crates.io:" >&2
+            printf '%s\n' "$OUT" | tail -3 >&2
+            exit 1
+          fi
+          echo "token OK (passed registry auth layer)"
+
+      - name: Publish (skip if already on crates.io)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          # ⚠️ 禁用 `cargo publish | tee` 模式——bash -e 无 pipefail 时 if 判定的是
+          # tee 的退出码（恒 0），cargo 失败被吞成假成功（gxp 首发即踩：400 邮箱
+          # 未验证被吞，job 假绿）。用重定向替代管道。
+          VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if curl -fsS -A gxp-release-workflow \
+               "https://crates.io/api/v1/crates/gxp/$VERSION" >/dev/null 2>&1; then
+            echo "gxp@$VERSION already published, skipping"
+            exit 0
+          fi
+          echo "publishing gxp@$VERSION ..."
+          # 幂等兜底：并发/重跑场景撞 already exists 视为成功
+          if cargo publish --locked >/tmp/publish.log 2>&1; then
+            tail -3 /tmp/publish.log
+            echo "published gxp@$VERSION"
+          else
+            cat /tmp/publish.log >&2
+            grep -q "already exists" /tmp/publish.log \
+              && echo "gxp@$VERSION already exists (race), treating as success" \
+              || exit 1
+          fi

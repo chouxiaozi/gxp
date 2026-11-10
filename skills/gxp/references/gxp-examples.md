@@ -166,6 +166,8 @@ gxp 'ERROR | sample 100 | sort by _ts' app.log
 
 唯一错误/唯一用户/唯一 trace。
 
+> ⚠️ **谓词先行**：纯 stage 查询（`distinct by trace_id` 单独出现）会被 BARE 模式吞掉当 ERE 搜文件——查询必须以谓词开头（下例均含谓词，安全）。
+
 ```bash
 # 整行去重（相同错误只留首条）
 gxp 'ERROR | distinct' app.log

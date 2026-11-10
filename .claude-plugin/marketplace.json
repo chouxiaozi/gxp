@@ -1,0 +1,15 @@
+{
+  "name": "cianlabs",
+  "owner": {
+    "name": "chouxiaozi",
+    "url": "https://github.com/cianlabs"
+  },
+  "description": "gxp — grep-aligned query language for LLM agents",
+  "plugins": [
+    {
+      "name": "gxp",
+      "source": "./",
+      "description": "Log/code queries for agents: BARE=ERE, field predicates, 14 pipeline verbs, ast() structural search"
+    }
+  ]
+}

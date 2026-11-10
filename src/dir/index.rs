@@ -122,6 +122,8 @@ impl DirIndex {
                 }
             }
             st.dirs_reused = st.dirs_visited;
+            // B17：确定性输出（与 PathPlan::walk 同构，文件系统枚举序跨平台不确定）
+            out.sort();
             return (out, st);
         }
 
@@ -231,6 +233,8 @@ impl DirIndex {
             }
         }
 
+        // B17：确定性输出（与 PathPlan::walk 同构镜像，两处返回点都排序）
+        out.sort();
         (out, st)
     }
 }
@@ -238,10 +242,14 @@ impl DirIndex {
 /// 判断 entry 是否为目录，支持 follow_symlinks 参数（对齐 Python `is_dir(follow_symlinks=...)`）。
 ///
 /// - `follow=false`：用 `file_type()`（不 follow symlink），symlink 指向目录返回 false
-/// - `follow=true`：用 `metadata()`（follow symlink），symlink 指向目录返回 true
+/// - `follow=true`：用 `fs::metadata(path)`（follow symlink），symlink 指向目录返回 true
+///
+/// B16：`DirEntry::metadata()` 是 lstat 语义（**不**跟随 symlink，与 `fs::metadata` 不同），
+/// 此前 follow 分支误用它导致 symlink-to-dir 判 false → 环检测分支不可达、links_skipped 恒 0。
+/// 测试走本函数（DirIndex::list），Windows 分支不建 symlink 掩盖，Linux CI 首跑暴露。
 fn is_dir_with_follow(e: &fs::DirEntry, follow: bool) -> std::io::Result<bool> {
     if follow {
-        e.metadata().map(|m| m.is_dir())
+        fs::metadata(e.path()).map(|m| m.is_dir())
     } else {
         e.file_type().map(|t| t.is_dir())
     }

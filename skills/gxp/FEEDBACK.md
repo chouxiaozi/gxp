@@ -1,6 +1,7 @@
 # gxp skill 反馈
 
 > 用于记录 skill 在使用中暴露的问题、改进建议、新场景需求。
+> 注意：经 Claude Code plugin / skills.sh 安装的用户，本文件会随插件更新被覆盖——反馈请直接提 <https://github.com/cianlabs/gxp/issues>（个人 skill 目录安装的用户可直接在本文件追加）。
 
 ## 反馈模板
 

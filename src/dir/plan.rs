@@ -284,13 +284,25 @@ impl PathPlan {
             };
 
             for e in entries.flatten() {
-                // 判定文件类型（不 follow symlink，与 Python PathPlan 一致）
+                // 判定文件类型（DirEntry::file_type 不 follow symlink，与 Python PathPlan 一致）
                 let ft = match e.file_type() {
                     Ok(t) => t,
                     Err(_) => continue,
                 };
+                // follow_links 模式下对 symlink 跟随 metadata 判定真实类型
+                // （B16：不跟随时 symlink-to-dir 的 is_dir()=false，环检测分支不可达，
+                //  links_skipped 恒 0——Linux CI 首跑暴露，Windows 测试分支不建 symlink 掩盖）
+                // 非 follow 模式 symlink 一律忽略（与 ripgrep 默认一致）；断链 symlink 跟随失败也忽略
+                let (is_file_now, is_dir_now) = if ft.is_symlink() && self.follow_links {
+                    match std::fs::metadata(e.path()) {
+                        Ok(m) => (m.is_file(), m.is_dir()),
+                        Err(_) => (false, false),
+                    }
+                } else {
+                    (ft.is_file(), ft.is_dir())
+                };
 
-                if ft.is_file() {
+                if is_file_now {
                     stats.files_seen += 1;
                     let name = e.file_name().to_string_lossy().into_owned();
                     let path = e.path();
@@ -313,7 +325,7 @@ impl PathPlan {
                         out.push(path);
                         stats.files_matched += 1;
                     }
-                } else if ft.is_dir() {
+                } else if is_dir_now {
                     // 计算子目录相对路径
                     let crel = if rel.is_empty() {
                         e.file_name().to_string_lossy().into_owned()
@@ -349,6 +361,10 @@ impl PathPlan {
             }
         }
 
+        // 输出排序：文件系统枚举序跨平台不确定（NTFS 字典序 / ext4 哈希 / APFS 不保证），
+        // 确定性输出是 LLM 友好原则（输出自包含）的前提；排序键为路径字典序，跨平台一致。
+        // B17：macOS CI 首跑暴露（a.log/b.log 输出序颠倒，测试断言首行为 a.log 失败）
+        out.sort();
         (out, stats)
     }
 }

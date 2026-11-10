@@ -8,10 +8,11 @@
 # - retire when: not retireable; this is the final safety net (cannot --no-verify bypass)
 #
 # Job map:
-#   check          fmt + clippy + test (all --all-features)  (blocking, PR + push, 3-platform matrix)
+#   check          fmt + clippy + test (all --all-features) + governance 体检（ubuntu 腿复用 dev 测试产物）(blocking, PR + push, 3-platform matrix)
 #   doc            cargo doc --no-deps          (blocking, PR + push, Linux-only)
 #   all-features   cargo build --all-features  (blocking, PR + push, Linux-only)
 #   deny           cargo-deny advisories/bans/licenses  (blocking, PR + push)
+#   plugin-lint    claude plugin validate + SKILL.md 结构 + skills.sh 发现 (blocking, PR + push)
 #   msrv           cargo check on rust-version (non-blocking, PR + push, info-only until stabilized)
 #   dry            jscpd copy-paste detector   (non-blocking, PR + push)
 #   coverage       cargo-llvm-cov              (non-blocking, Windows-only, PR + push)
@@ -25,6 +26,9 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    - cron: '0 4 * * 0'   # 周日 04:00 UTC：mutation job（仅此事件跑，见其 if 条件）
+  workflow_dispatch:       # 手动触发（可单独跑 mutation / 全量）
 
 env:
   CARGO_TERM_COLOR: always
@@ -41,7 +45,7 @@ jobs:
         os: [windows-latest, ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -65,11 +69,21 @@ jobs:
       - name: cargo test
         run: cargo test --all-features --no-fail-fast
 
+      - name: docs governance 体检
+        # 并入 check job（2026-11-10）：原独立 job 229s 全场最慢——4.1.8 两套
+        # --release -- --list 在独立 runner 上全量重编测试二进制；并入后走 dev
+        # profile 紧随 cargo test，default(=l3，crates.io 首发后默认开) 一套指纹
+        # 补编即可。仅 ubuntu 腿跑：文档对账与平台无关，避免三腿重复。
+        if: matrix.os == 'ubuntu-latest'
+        run: bash scripts/check_governance.sh
+        env:
+          GXP_TEST_PROFILE: dev
+
   doc:
     name: cargo doc
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain (stable)
         uses: dtolnay/rust-toolchain@stable
@@ -84,20 +98,11 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
-  governance:
-    name: docs governance 体检
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Run governance 体检
-        run: bash scripts/check_governance.sh
-
   all-features:
     name: cargo build --all-features
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain (stable)
         uses: dtolnay/rust-toolchain@stable
@@ -112,7 +117,7 @@ jobs:
     name: cargo-deny check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install cargo-deny
         uses: taiki-e/install-action@v2
@@ -122,25 +127,44 @@ jobs:
       - name: cargo deny check
         run: cargo deny check advisories bans licenses
 
+  plugin-lint:
+    name: plugin / skill distribution gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # claude CLI 钉版本防漂移（plugin validate 为离线 manifest 校验，无需登录）；
+      # node/npx 与 jq 用 runner 预装
+      - name: Install claude CLI (pinned)
+        run: npm install -g @anthropic-ai/claude-code@2.1.322
+
+      - name: Run plugin + skills.sh gate (scripts/check_plugin.sh)
+        run: sh scripts/check_plugin.sh
+
   # === Non-blocking info gates ===
   # These run for visibility but use continue-on-error so PRs aren't blocked.
   # Tighten to blocking once the project has stabilized (see feedback_gate_config_adapts_to_context.md).
 
   msrv:
-    name: MSRV (rust-version = 1.75)
+    name: MSRV (rust-version = 1.90)
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - name: Install Rust 1.75 (declared MSRV in Cargo.toml)
-        uses: dtolnay/rust-toolchain@1.75.0
+      - name: Install Rust 1.90 (declared MSRV in Cargo.toml)
+        uses: dtolnay/rust-toolchain@1.90.0
 
       - name: Cache cargo + target
         uses: Swatinem/rust-cache@v2
 
       - name: cargo check --all-features on MSRV
-        # v1: info-only. Verifies Cargo.toml's rust-version=1.75 compiles with --all-features.
+        # v1: info-only. Verifies Cargo.toml's rust-version=1.90 compiles with --all-features.
+        # MSRV 演进（2026-11-09 CI 实测诊断）：1.75（v0.28 声明）→ 1.85 → 1.90。
+        # 依赖树真实要求：tree-sitter 0.27.1 → rustc 1.90（ast-grep 链硬约束）；
+        # globset 0.4.20 / ignore 0.4.33 / encoding_rs 0.8.42 → rustc 1.88。
+        # cargo 解析 lock 全量解析 manifest + rust-version 感知选择，与 feature 开关无关，
+        # 诚实声明依赖现实（降级锁 4+ 包不可持续）。
         # Tighten to blocking after remote CI has 3 consecutive green runs (remove continue-on-error).
         run: cargo check --all-features --locked
 
@@ -149,21 +173,22 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install jscpd
         run: sudo npm install -g jscpd
 
-      - name: Run jscpd
-        # L1/L2/DSL/pipeline 已落地，收紧到 threshold 5
-        run: jscpd --format "rust" --reporter console --threshold 5 --exitCode 1 src/ tests/
+      - name: Run DRY gate (scripts/check-dry.sh)
+        # 命令抽到脚本：本地可复现 CI 判定（jscpd 5.x 参数语义陷阱见脚本头注释，
+        # 曾因 --exit-code 覆盖 --threshold 致每次必红，42639769811）。
+        run: sh scripts/check-dry.sh
 
   coverage:
     name: coverage (cargo-llvm-cov)
     runs-on: windows-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain (GNU, stable)
         uses: dtolnay/rust-toolchain@stable
@@ -186,13 +211,15 @@ jobs:
 
   mutation:
     name: mutation (cargo-mutants)
-    # Only on main push; mutation is slow (30min) and requires high coverage first
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # 周定时 + 手动触发（2026-11-09 调整）：随 main push 连续两轮被共享 runner 抢占中断
+    # （shutdown signal），11min 大 job 暴露面大且 info-only 价值不随每次 push 递增；
+    # cargo-mutants 结果主要服务于阶段性质量评估（与 Bench 同模式的 schedule + dispatch）
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     continue-on-error: true
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain (stable)
         uses: dtolnay/rust-toolchain@stable
@@ -218,7 +245,7 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain (nightly)
         uses: dtolnay/rust-toolchain@nightly

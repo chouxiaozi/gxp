@@ -94,9 +94,15 @@ else
     else
         # cargo test -- --list 输出格式："test_name: test"，最后一行汇总 "N tests, ..."
         # 不依赖汇总行（不同 cargo 版本格式不同），直接 grep -c ": test$"
-        # 用 --release 复用 target/release/（pre-commit 时不必重新编译 dev profile）
-        ACTUAL_DEFAULT=$(cargo test --release -- --list 2>/dev/null | grep -c ": test$")
-        ACTUAL_L3=$(cargo test --features l3-structural --release -- --list 2>/dev/null | grep -c ": test$")
+        # 编译 profile：GXP_TEST_PROFILE=release（默认，本地 pre-commit 复用 target/release
+        # 既有产物）/ dev（CI check job 传 dev——紧随 cargo test 之后复用刚编好的产物；
+        # 注 default 自 l3 默认开启后与 --features l3-structural 指纹相同，第二次 --list 恒秒回）
+        TEST_PROFILE=${GXP_TEST_PROFILE:-release}
+        PROFILE_FLAG=""
+        [ "$TEST_PROFILE" = "release" ] && PROFILE_FLAG="--release"
+        # 故意不加引号：PROFILE_FLAG 需按词展开（release 为 --release，dev 为空）
+        ACTUAL_DEFAULT=$(cargo test $PROFILE_FLAG -- --list 2>/dev/null | grep -c ": test$")
+        ACTUAL_L3=$(cargo test --features l3-structural $PROFILE_FLAG -- --list 2>/dev/null | grep -c ": test$")
 
         if [ -z "$ACTUAL_DEFAULT" ] || [ -z "$ACTUAL_L3" ]; then
             echo "[governance] 4.1.8 测试数对账：cargo test --list 失败（跳过，可能未编译）"

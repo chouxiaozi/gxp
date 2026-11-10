@@ -1,0 +1,84 @@
+# gxp 自动性能测试 — criterion 趋势留档 + 显著劣化告警（不做阻断门禁）
+#
+# 触发：手动（workflow_dispatch）+ 每周日 03:00 UTC 定时
+# 覆盖：AGENTS.md §7.1 三个基线锚点指标对应的 bench
+#   - l1_scan      （L1 两遍链锚点）
+#   - l2_extract   （L2 字段抽取锚点）
+#   - full_pipeline（全管道锚点）
+# 语料：各 bench 自带幂等 setup_corpus()（44MB / 31931 行合成语料，首跑自动生成）
+#
+# 口径声明（诚实 > 承诺）：
+# - GitHub runner 机器抖动大（共享 CPU + 代际更换），CI bench 数值**仅作趋势参考**
+# - 权威回归门禁保持本机同机 A/B（AGENTS.md §7.1：median 劣化 >10% 需归因），
+#   本流水线不设 fail-threshold，不阻断任何合并/发布
+# - 趋势历史：每次 run 的 bencher 输出按时间戳追加到 gh-pages 分支 bench/ 目录，
+#   README.md 汇总全部历史（纯 git worktree 自管，零第三方 action 依赖）
+
+name: Bench
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * 0'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench:
+    name: criterion bench (ubuntu)
+    runs-on: ubuntu-24.04  # 锁定：bench 趋势数据要求环境稳定（ubuntu-latest 滚动 26.04 会致序列断裂，runner-images#14748）
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run benchmarks (criterion, bencher output)
+        run: |
+          cargo bench --bench l1_scan --bench l2_extract --bench full_pipeline \
+            -- --output-format bencher | tee bench_output.txt
+
+      - name: Append benchmark record to gh-pages (trend history)
+        run: |
+          STAMP="$(date -u +%Y-%m-%dT%H%MZ)"
+          RECORD="bench/${STAMP}/bench_output.txt"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin gh-pages || true
+          if git show-ref --verify --quiet refs/remotes/origin/gh-pages; then
+            git worktree add -B gh-pages gh-pages-dir origin/gh-pages
+          else
+            git worktree add --orphan -B gh-pages gh-pages-dir
+          fi
+          mkdir -p "gh-pages-dir/$(dirname "$RECORD")"
+          cp bench_output.txt "gh-pages-dir/$RECORD"
+          {
+            echo "# gxp criterion bench history（runner 趋势参考，非门禁）"
+            echo
+            echo "权威回归门禁 = 本机同机 A/B（AGENTS.md §7.1）。runner 数值仅作跨版本趋势参考。"
+            echo
+            ( cd gh-pages-dir && find bench -name 'bench_output.txt' | sort ) | while read -r f; do
+              echo "## ${f#bench/}"
+              echo '```'
+              cat "gh-pages-dir/$f"
+              echo '```'
+              echo
+            done
+          } > gh-pages-dir/README.md
+          ( cd gh-pages-dir && git add -A && git commit -m "bench: ${STAMP} [skip ci]" ) || echo "no changes to commit"
+          ( cd gh-pages-dir && git push origin gh-pages )
+
+      - name: Upload raw output
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-output
+          path: bench_output.txt

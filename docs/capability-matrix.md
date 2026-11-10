@@ -4,7 +4,7 @@
 > **更新规则**：每次功能落地或变更后更新对应行；更新时修改底部"最后更新"时间。
 > **与路线图的关系**：本文档是横向能力快照；`docs/changelog.md` 是纵向版本演进。两者互补。
 
-**最后更新**: 见 `docs/changelog.md` 最新版本（v0.47 — B14 无括号混合 `&&`/`||` 与 Regex 组合的 L1 下推健全性修复，详见 changelog v0.47 行）
+**最后更新**: 见 `docs/changelog.md` 最新版本（v0.49 — 发版收尾·skill 分发 plugin 化 + T1a 性能优化，详见 changelog v0.49 行）
 **测试基线**: 见 §4 代码规模表
 
 ---
@@ -127,8 +127,8 @@
 |---|---|
 | Rust 源文件 | 48 个 |
 | 源码总行数 | ~17,129 行 |
-| 集成测试文件 | 25 个 |
+| 集成测试文件 | 26 个 |
 | 基准 bench 文件 | 15 个 |
-| 默认 feature 测试 | 1030 全绿（v0.49 实测 2026-11-09，governance §4.1.8 自动对账） |
-| l3-structural feature 测试 | 1125 全绿（v0.49 实测 2026-11-09，governance §4.1.8 自动对账） |
+| 默认 feature 测试 | 1134 全绿（v0.49.0 实测 2026-11-10，+4 为 cli_readme_examples README 示例可执行守护 e2e，+5 为 cli_skill_examples skill 分发示例守护 e2e；governance §4.1.8 自动对账；l3-structural 自 crates.io 首发起默认开启——与预编译二进制全功能开箱即用一致，见 Cargo.toml [features] 注释） |
+| l3-structural feature 测试 | 1134 全绿（与默认集相同，l3 已默认开启；裁剪模式 --no-default-features 上次实测 1030，v0.49 2026-11-09，未随 +5 复测） |
 | 生产依赖 crate | 14 个（+ 4 optional/dev） |

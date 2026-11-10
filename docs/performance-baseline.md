@@ -233,7 +233,7 @@ v0.45 diag_pipeline 的 execute_stages median 14.12ms vs v0.41 的 8.74ms（+61.
 
 ### 1.3 大数据实测（v0.42，2026-10-27）
 
-> 12GB 合成 CodeAgent transcript 数据集（30 个真实模板 round-robin 复制到 11603 文件 / 60 子目录），用于验证 v1 在 >10GB 量级是否适用。
+> 12GB 合成 agent transcript 数据集（30 个真实模板 round-robin 复制到 11603 文件 / 60 子目录），用于验证 v1 在 >10GB 量级是否适用。
 
 #### 12GB 目录多轮实测（6 查询 × 3 轮，median）
 

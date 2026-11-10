@@ -1,0 +1,11 @@
+{
+  "name": "gxp",
+  "description": "gxp — grep-aligned query language for LLM agents",
+  "author": {
+    "name": "chouxiaozi",
+    "url": "https://github.com/cianlabs"
+  },
+  "homepage": "https://github.com/cianlabs/gxp",
+  "license": "MIT OR Apache-2.0",
+  "keywords": ["grep", "logs", "query-language", "cli", "llm", "agent"]
+}

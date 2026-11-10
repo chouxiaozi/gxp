@@ -149,12 +149,24 @@ fn test_symlink_loop_terminates() {
     }
     #[cfg(not(unix))]
     {
-        // Windows 非开发者模式无法创建 symlink，仅做 smoke test
-        let _ = link_path;
-        let plan = PathPlan::new().with_follow_links(true);
-        let mut idx = DirIndex::new(tmp.path(), FreshnessMode::Lax);
-        let (files, _) = idx.list(&plan);
-        assert!(files.iter().all(|f| f.is_file()));
+        // Windows：开发者模式/管理员可建 symlink 时走真实验证（B16 后三平台同覆盖），
+        // 无特权（普通用户会话）则降级 smoke test
+        match std::os::windows::fs::symlink_dir(tmp.path(), &link_path) {
+            Ok(_) => {
+                let plan = PathPlan::new().with_follow_links(true).with_max_depth(6);
+                let mut idx = DirIndex::new(tmp.path(), FreshnessMode::Lax);
+                let (files, st) = idx.list(&plan);
+                let _ = files;
+                assert!(st.links_skipped > 0, "应跳过环: {:?}", st);
+            }
+            Err(e) => {
+                eprintln!("skip symlink test (no privilege): {}", e);
+                let plan = PathPlan::new().with_follow_links(true);
+                let mut idx = DirIndex::new(tmp.path(), FreshnessMode::Lax);
+                let (files, _) = idx.list(&plan);
+                assert!(files.iter().all(|f| f.is_file()));
+            }
+        }
     }
 }
 
