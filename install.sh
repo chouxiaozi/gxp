@@ -4,7 +4,7 @@
 # 用法（仓库转公开后生效）：
 #   curl -fsSL https://github.com/cianlabs/gxp/raw/main/install.sh | sh
 #   curl -fsSL https://github.com/cianlabs/gxp/raw/main/install.sh | sh -s -- --with-skill
-#   sh install.sh --version v0.49.0 --with-skill --bin-dir ~/.local/bin
+#   sh install.sh --version v0.49.1 --with-skill --bin-dir ~/.local/bin
 #
 # 功能：
 #   1. 探测 OS/ARCH → 映射 GitHub Release 预编译包（4 平台）

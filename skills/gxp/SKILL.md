@@ -43,7 +43,7 @@ gxp 'function_name' src/
 # gxp DSL（字段谓词 + 管道）
 gxp '"timeout" && cost_ms>800 | rank top 20 by cost_ms desc | fields _ts,_tag,cost_ms' app.log
 
-# AST 结构查询（需构建期 feature：cargo build --features l3-structural --release；查询侧无 --features 旗标）
+# AST 结构查询（l3-structural 自 v0.49.0 起默认启用——预编译包与 cargo install 开箱即得；查询侧无 --features 旗标）
 gxp 'ast(rs, "fn $NAME($ARGS) { $BODY }")' src/
 
 # 通用 flag

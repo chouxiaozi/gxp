@@ -119,7 +119,7 @@ gxp 'capture(trace_id, /req-\d+/) | fields trace_id' app.log
 gxp '"ERROR" && capture(user_id, /uid=\d+/) | fields user_id' app.log
 
 # trace_id + 时间窗口组合
-gxp '_ts between "T1" and "T2" && capture(trace_id, /req-\d{8}/) | fields _ts,trace_id' app.log
+gxp '_ts between "2026-10-27T10:00:00Z" and "2026-10-27T11:00:00Z" && capture(trace_id, /req-\d{8}/) | fields _ts,trace_id' app.log
 ```
 
 ## E. 文件清单

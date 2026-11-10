@@ -74,7 +74,7 @@ gxp 'a|b' app.log                            # ERE 的 OR
 gxp 'ast(LANG, "PATTERN")' <dir>
 ```
 
-**前置条件**：ast() 需要二进制构建时启用 `l3-structural` feature（`cargo build --features l3-structural --release`）；查询侧没有 `--features` 旗标，默认构建遇 `ast()` 会 fail-loud 提示重建。
+**前置条件**：ast() 由 `l3-structural` feature 提供，**自 v0.49.0 起默认启用**——预编译二进制与 `cargo install gxp` 开箱可用；仅 `--no-default-features` 裁剪构建不含（遇 `ast()` fail-loud 提示重建）；查询侧没有 `--features` 旗标。
 
 **支持语言**（v0.48 全量 9 种）：`ts` / `rs` / `py` / `js` / `go` / `tsx` / `java` / `c` / `cpp`。大小写不敏感 + 别名（`c++`/`cxx`/`cc` → `cpp`）。
 
