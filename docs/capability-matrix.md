@@ -32,6 +32,7 @@
 | | `Exists`（字段存在性） | ✅ | 同上 | cli_e2e |
 | | `Not`（三态取反：True→False / False→True / NotNumeric→True） | ✅ | 同上 | cli_e2e |
 | | `find_value` 懒单字段定位（跳过全格式 extract） | ✅ | `extract.rs::find_value` | l2_extract.rs |
+| | logfmt 带引号值提取（`k="v"`：值为引号内字节、终点为闭合引号，与 JSON 通路对齐；未闭合回退空白切分） | ✅ v0.50 | `extract.rs::extract_logfmt_kv` + `find_value`（镜像同步） | tests/l2_extract.rs + `tests/cli_quoted_logfmt.rs` e2e |
 | | `batch_find_values` 多字段批量提取（n≥3 走 batch） | ✅ | `extract.rs::batch_find_values` | l2_extract.rs |
 | | `ast_lines` 集合查询（L3 预计算结果） | ✅ | `detect.rs::EvalCtx` | cli_e2e (l3-structural) |
 | | `capture(NAME, /REGEX/)` 正则捕获组提取 | ✅ | `src/mode/eval.rs::eval_prepared_with_captures` | cli_e2e |
@@ -87,6 +88,7 @@
 | | `--glob PATTERN`（文件名过滤） | ✅ | `src/cli.rs` + `src/dir/plan.rs` | cli_e2e |
 | | `--no-gitignore`（覆盖默认 .gitignore 尊重） | ✅ | `src/cli.rs` | cli_e2e |
 | | `--generate-completion SHELL`（shell completion） | ✅ | `src/cli.rs` + `clap_complete` | cli_e2e |
+| | `--query-file PATH`（查询从文件读取，免 shell 引号层；空文件/多行/与位置 pattern 互斥 fail-loud） | ✅ v0.50 | `src/cli.rs` + `mode/detect.rs` | `tests/cli_query_file.rs` e2e（三路径） |
 | | 四段式报错（11 个 grep 短选项全覆盖） | ✅ | `mode/reject_grep_opts.rs` + `error.rs` | `tests/cli_bare.rs`（10 短选项 e2e）+ `src/mode/reject_grep_opts.rs` 内联单测 |
 | | stdin 管道（`some_cmd | gxp 'pattern'` / `gxp 'pattern' -`） | ✅ | `io/file.rs::read_stdin_for_scan` + `mode/detect.rs::dispatch_stdin` | cli_e2e 15 项 stdin 测试 |
 | | 流式扫描（文件 > 512MB 走 BufReader） | ✅ | `src/l1/scan.rs::scan_stream_lines_cb` | cli_e2e streaming 测试 |
@@ -126,9 +128,9 @@
 | 维度 | 数量 |
 |---|---|
 | Rust 源文件 | 48 个 |
-| 源码总行数 | ~17,129 行 |
-| 集成测试文件 | 26 个 |
+| 源码总行数 | ~17,500 行 |
+| 集成测试文件 | 29 个 |
 | 基准 bench 文件 | 15 个 |
-| 默认 feature 测试 | 1134 全绿（v0.49.0 实测 2026-11-10，+4 为 cli_readme_examples README 示例可执行守护 e2e，+5 为 cli_skill_examples skill 分发示例守护 e2e；governance §4.1.8 自动对账；l3-structural 自 crates.io 首发起默认开启——与预编译二进制全功能开箱即用一致，见 Cargo.toml [features] 注释） |
-| l3-structural feature 测试 | 1134 全绿（与默认集相同，l3 已默认开启；裁剪模式 --no-default-features 上次实测 1030，v0.49 2026-11-09，未随 +5 复测） |
+| 默认 feature 测试 | 1197 全绿（v0.50.0 实测 2026-11-11，+63 vs v0.49.0 的 1134：--query-file 25[11 单元+14 e2e 三路径] + logfmt 带引号值 24[9 单元+15 e2e 谓词全家] + 引号提示四挂点 15[7 单元+8 e2e]；governance §4.1.8 自动对账；l3-structural 自 crates.io 首发起默认开启——与预编译二进制全功能开箱即用一致，见 Cargo.toml [features] 注释） |
+| l3-structural feature 测试 | 1197 全绿（与默认集相同，l3 已默认开启；裁剪模式 --no-default-features 上次实测 1030，v0.49 2026-11-09，未随 v0.50 +63 复测） |
 | 生产依赖 crate | 14 个（+ 4 optional/dev） |

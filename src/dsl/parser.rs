@@ -298,13 +298,22 @@ fn parse_expr(input: &str) -> Result<Expr> {
             // ast()/capture() 解析失败时给出 LLM 友好的错误消息
             let trimmed = input.trim_start();
             if trimmed.starts_with("ast") {
+                // v0.50：输入完全不含双引号 → PATTERN 的双引号大概率被 shell 剥掉
+                // （PS 5.1 吃内层双引号，实测 `ast(rs, $OBJ.unwrap())` 即此形态，
+                // 见 changelog v0.50 引号矩阵）——附加根因提示，避免误诊"AST 不可用"
+                let shell_hint = if !input.contains('"') {
+                    "\n提示：输入不含双引号——若在 PowerShell 调用，shell 可能剥掉了 PATTERN 的双引号。\n\
+                     出路：① Bash 等单层引号 shell；② cmd /c 包装；③ 查询写入文件（gxp --query-file QUERY_FILE FILE）"
+                } else {
+                    ""
+                };
                 Err(GxpError::Parse {
                     detail: format!(
                         "ast() 语法错误。正确语法：ast(NAME, \"PATTERN\")\n\
                          NAME 支持大小写不敏感：ts/rs/py/js/go/tsx/java/c/cpp/c++\n\
                          PATTERN 必须用双引号包裹（不支持单引号/无引号）\n\
                          示例：ast(java, \"logger.info($$$A)\")\n\
-                         输入：{input}"
+                         输入：{input}{shell_hint}"
                     ),
                 })
             } else if trimmed.starts_with("capture") {

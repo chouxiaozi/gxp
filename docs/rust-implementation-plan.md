@@ -92,6 +92,7 @@
 - `LineFormat`（Plain/Logfmt/JsonLine/BracketTag/IsoTimestamp/Mixed）基于首字符 + 分隔符密度探测
 - `ExtractedFields` 零拷贝视图：`kv: Vec<(&[u8], &[u8])>` + `tags: Vec<&[u8]>` + `timestamp`
 - `find_value(line, name)` 懒单字段定位
+- logfmt 带引号值（v0.50）：`k="v"` 值为引号内字节、值终点为闭合 `"`；`extract_logfmt_kv` 与 `find_value` **镜像同步**（§6.5.3 同构约束）；未闭合引号回退空白切分（设计文档 §3.3 带引号值契约）
 - `batch_find_values(line, names)` 多字段批量提取（`BATCH_THRESHOLD=3`）
 - `parse_numeric_value(v: &[u8]) -> Option<f64>`：11 维契约，拒绝千分位/单位/空白 trim/NaN/布尔
 - `eval_numeric(value_bytes, op, threshold) -> bool`：parse 失败 → false（fail-safe）
@@ -283,6 +284,7 @@ gxp **不是 grep 的严格超集**（D1），不接受 grep 短选项参数。�
 - `is_gxp_mode(pattern)` 检测双引号/`&&`/`||`/`!`/管道 `|`/字段谓词特征 + `ast(`/`capture(` 前缀
 - `detect_and_dispatch` 入口分派 BARE vs gxp 模式
 - `format_reject_error` 四段式报错
+- `--query-file PATH`（v0.50）：查询从文件读取（剥 BOM + trim）后**前置为 `args[0]`**，`detect_and_dispatch` 对此透明；前置形态由 clap 解析，后置双形态（`--query-file P` / `--query-file=P`）进 `extract_trailing_flags` + `KNOWN_LONG_FLAGS`；空文件/多行/与位置 pattern 互斥均 fail-loud（设计文档 §1.5 + §2.4 示例 12）
 
 ### 7.4 `!` 词法规则（D6，方向 C）
 
@@ -663,6 +665,8 @@ gxp/
 | MatchedLine.line: Arc<[u8]> | `line: Vec<u8>` → `Arc<[u8]>` | 借用 `&'a [u8]`（破坏 Send+Sync）/ 全面 Arc 化 | 唯一不破坏 V1 Send+Sync 的 L1 改动；大文件场景自动受益 |
 | 字符串等值 `NAME="STRING"` 解析期脱糖为单元素 In（v0.48） | 脱糖（零新 AST 节点） | 新增 Pred::EqString 变体 + L1/L2 分支 | A/B 实验第一摩擦源；构造性等价消除 L1/L2 镜像风险（§6.5.3 B14 类）；`=` 单等号非数值 RHS 同时回归 ERE 字面量（对齐设计文档分歧操作符列表） |
 | L2 Literal 重校验豁免 + collect 零分配化（v0.49） | `verified_literals`（单元素纯字面量必选组成员）+ `l1_verified` 标志 + match_bytes/path Arc 化 | 树路径平行判定（Paren(And) 陷阱不健全）/ 惰性 match_bytes（需 compiled 穿透 stage 层） | T1a 归因 ~16ms 三项冗余实测；豁免健全性构造性论证见 §7.9；--verify 共用 build 同错对齐 → 独立期望集 e2e 强制 |
+| logfmt 带引号值提取（v0.50） | 值以 `"` 包裹时值为引号内字节、终点为闭合引号；`extract_logfmt_kv` + `find_value` 镜像同步；未闭合回退空白切分 | eval 层比较时剥引号（投影值仍带引号，`fields`/`distinct`/`stats` 自相矛盾） | 提取层单一事实源，与 JSON 通路对齐；string equality 跨格式一致；数值谓词语义外溢显式声明（changelog v0.50）；L1 前缀下推在字段名侧不受影响（`L1 ⊇ L2` 保持） |
+| `--query-file PATH` 免引号通道（v0.50） | 查询文件读取后前置为 `args[0]`，分发层透明 | 环境变量 `GXP_QUERY`（两步调用/会话状态泄漏/不可组合）；DSL 引入单引号字符串（触 D3 硬约束，与 ast pattern 内 `'a'` 字面歧义） | 引号丢失后查询与合法字面量逐字节相同、产品侧不可检测；查询文件即 agent Write 工具产物（场景 §0.2-I）；备选对比与对抗评审记录见 changelog v0.50 |
 
 ---
 

@@ -29,6 +29,12 @@ pub struct ExecutionPlan {
     pub field_predicates: Vec<FieldPredicateView>,
     /// 管道动词摘要。
     pub stages: Vec<StageView>,
+    /// 含 `=` 的 **bare** 字面量（v0.50 引号自检提示源）。
+    ///
+    /// `Prim::Bare` 且含 `=`（如 `level=ERROR`）是 shell 剥掉字符串等值引号
+    /// （`level="ERROR"`）的典型残留；带引号的 STRING 字面量（如 `"cost>800"`）
+    /// 不在此列。非空时 [`ExecutionPlan::render_text`] 追加自检提示行。
+    pub bare_eq_literals: Vec<String>,
 }
 
 /// L1 必选组视图（组内 OR）。
@@ -201,11 +207,41 @@ pub fn build_plan(q: &Query, compiled: &CompiledL1) -> crate::Result<ExecutionPl
 
     let stages: Vec<StageView> = q.stages.iter().map(stage_view).collect();
 
+    let bare_eq_literals = collect_bare_eq(&q.expr);
+
     Ok(ExecutionPlan {
         required_groups,
         field_predicates,
         stages,
+        bare_eq_literals,
     })
+}
+
+/// 递归收集含 `=` 的 bare 字面量（v0.50 引号自检）。
+///
+/// 只命中 [`crate::dsl::ast::Prim::Bare`]（STRING 字面量含 `=` 是合法用法，
+/// 如 `"cost>800"`，不误报）。递归形状与 `detect::l1_exact` / `has_any_ast`
+/// 家族一致（And/Or/Not/Paren 全展开，Prim 按变体分流）。
+fn collect_bare_eq(expr: &crate::dsl::ast::Expr) -> Vec<String> {
+    use crate::dsl::ast::{Expr, Prim};
+    match expr {
+        Expr::And(l, r) | Expr::Or(l, r) => {
+            let mut v = collect_bare_eq(l);
+            v.extend(collect_bare_eq(r));
+            v
+        }
+        Expr::Not(e) => collect_bare_eq(e),
+        Expr::Prim(Prim::Paren(e)) => collect_bare_eq(e),
+        Expr::Prim(Prim::Bare(s)) if s.contains('=') => vec![s.clone()],
+        Expr::Prim(
+            Prim::Bare(_)
+            | Prim::String(_)
+            | Prim::Regex(_)
+            | Prim::Pred(_)
+            | Prim::Ast { .. }
+            | Prim::Capture { .. },
+        ) => Vec::new(),
+    }
 }
 
 /// 构造单个 [`FieldPredicateView`]（阈值/边界预解析）。
@@ -359,6 +395,23 @@ impl ExecutionPlan {
                 out.push_str(&render_stage_text(s));
                 out.push('\n');
             }
+        }
+
+        // v0.50 引号自检：bare 字面量含 '=' 是 shell 剥引号的典型残留
+        //（`level=ERROR | count` 静默解析为字面量查询而非谓词——argv 层
+        // 与合法字面量逐字节相同，只能在计划层提示，见 changelog v0.50）
+        if !self.bare_eq_literals.is_empty() {
+            let lits: Vec<String> = self
+                .bare_eq_literals
+                .iter()
+                .map(|s| format!("{s:?}"))
+                .collect();
+            let first = &self.bare_eq_literals[0];
+            out.push_str(&format!(
+                "提示: bare 字面量含 '='（{}）——若期望字段等值谓词，引号可能被 shell 剥除（正确形态 {}）\n",
+                lits.join(", "),
+                crate::mode::detect::quote_eq_fix(first)
+            ));
         }
         out
     }
@@ -660,5 +713,38 @@ mod tests {
             text.contains("(无字面量约束"),
             "文本应含'无字面量约束'，实际: {text}"
         );
+    }
+
+    // --- v0.50 bare 字面量含 '=' 引号自检 ---
+
+    #[test]
+    fn test_bare_eq_literal_flagged_with_hint() {
+        // `level=ERROR | count`：bare 含 '=' → 计划标记 + 渲染提示行
+        let q = crate::dsl::parser::parse_query("level=ERROR | count").expect("parse 应成功");
+        let compiled = compile(&q.expr).expect("编译应成功");
+        let plan = build_plan(&q, &compiled).expect("build_plan 应成功");
+        assert_eq!(plan.bare_eq_literals, vec!["level=ERROR".to_string()]);
+        let text = plan.render_text();
+        assert!(text.contains("bare 字面量含 '='"), "得到: {text}");
+        assert!(text.contains("level=\"ERROR\""), "提示应含修复形态: {text}");
+    }
+
+    #[test]
+    fn test_string_literal_with_eq_not_flagged() {
+        // `"cost>800" | count`：STRING 字面量含 '=' 是合法用法，不提示
+        let q = crate::dsl::parser::parse_query(r#""cost>800" | count"#).expect("parse 应成功");
+        let compiled = compile(&q.expr).expect("编译应成功");
+        let plan = build_plan(&q, &compiled).expect("build_plan 应成功");
+        assert!(plan.bare_eq_literals.is_empty());
+        assert!(!plan.render_text().contains("bare 字面量含"));
+    }
+
+    #[test]
+    fn test_bare_eq_nested_in_bool() {
+        // 布尔子树内也能收集：`level=ERROR && "x"`
+        let q = crate::dsl::parser::parse_query(r#"level=ERROR && "x""#).expect("parse 应成功");
+        let compiled = compile(&q.expr).expect("编译应成功");
+        let plan = build_plan(&q, &compiled).expect("build_plan 应成功");
+        assert_eq!(plan.bare_eq_literals, vec!["level=ERROR".to_string()]);
     }
 }

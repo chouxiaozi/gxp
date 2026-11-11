@@ -104,7 +104,33 @@ gxp 'ast(cpp, "namespace $NS { $$$B }")' src/         # C++ namespace 声明
 | `--strict` | 字段探活 fail-loud（写错字段名直接报错） |
 | `--glob PATTERN` | 文件名过滤（如 `--glob '*.rs'`） |
 | `--no-gitignore` | 覆盖默认 .gitignore 尊重 |
+| `--query-file PATH` | 查询从文件读取（v0.50，免 shell 引号层；单查询单行；与位置 pattern 互斥） |
 | `--generate-completion SHELL` | shell completion（bash/zsh/fish/ps） |
+
+## Windows PowerShell 引号（高危坑，v0.50 实测矩阵）
+
+> 实测环境：pwsh 7.6.9（`PSNativeCommandArgumentPassing=Windows`）/ Windows PowerShell 5.1.26100 / Git-Bash 类单层引号 shell；gxp 0.49+，2026-11-11。shell 行为会随版本变化——异常时先用 `--explain` 自检（见下）。
+
+查询含**内层双引号**（`level="ERROR"`、`ast(rs, "PATTERN")`）时，PowerShell 的正确习惯在 5.1 与 7+ 之间**互为颠倒**：
+
+| 写法 | pwsh 7.3+ | PS 5.1 | bash 类 |
+|---|---|---|---|
+| `gxp 'level="ERROR" \| count' f`（单引号+裸内层引号） | ✅ | ❌ 引号被吃 → 静默退化 | ✅ |
+| `gxp 'level=\"ERROR\" \| count' f`（`\\"` 转义） | ❌ 反斜杠入 pattern → **0 命中 exit 0 无警告** | ✅（恰好被还原） | ❌ 同 pwsh |
+| `gxp --% "level=\"ERROR\" \| count" f` | ❌（脚本内 argv 碎裂） | ✅ | — |
+| `cmd /c 'gxp "level=\"ERROR\" \| count" f'` | ✅ | ✅ | — |
+| 查询写入文件 + `gxp --query-file q.gxp f` | ✅ | ✅ | ✅ |
+
+**规则**：
+1. **首选 Bash 等单层引号 shell**（Claude Code 用 Bash 工具跑 gxp 含引号查询）。
+2. pwsh 7.3+：单引号包裹 + 裸内层 `"` 即可；**永远不要写 `\"`**（仅 `cmd /c` 内层合法）。
+3. PS 5.1 / 不确定版本：`cmd /c` 包装，或查询写入文件走 `--query-file`（彻底绕开引号层，agent 用 Write 工具落盘即用）。
+4. `ast()`/`capture()` 被剥引号时会 fail-loud（多文件参数错 / ast 语法错），v0.50 起错误文案含 shell 根因提示。
+
+**自检协议（引号是否完整到达解析器）**：给查询挂 `--explain`——
+- ✅ 正确：`L2 字段谓词:` 下出现 `level in [ERROR]`
+- ❌ 引号被剥：`L1 必选组:` 下出现字面量 `"level=ERROR"`（且 v0.50 起渲染 `bare 字面量含 '='` 提示行）
+- 注意：gxp 0 命中恒 exit 0（无区分信号），**不要**用退出码判断。
 
 ## 输出字段（JSON 模式自包含）
 

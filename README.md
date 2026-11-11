@@ -40,6 +40,8 @@ cargo install --locked gxp
 
 Prebuilt packages for Linux / Windows / macOS arm64 / macOS x64 (each with a sha256) are also on the [Releases](https://github.com/cianlabs/gxp/releases) page.
 
+> **Windows PowerShell note**: queries containing inner double quotes (`level="ERROR"`, `ast(rs, "PATTERN")`) hit shell quoting pitfalls — PS 5.1 strips inner quotes (query silently degrades to a literal search), while `\"` escaping leaks backslashes on pwsh 7+/bash. Prefer a single-layer-quoting shell (Git Bash), or write the query to a file and run `gxp --query-file query.gxp app.log` (v0.50, quoting-proof). Self-check with `--explain`: a string-equality predicate should appear under `L2 字段谓词`, not as an L1 literal. Full tested matrix: `skills/gxp/references/gxp-syntax.md` → "Windows PowerShell 引号".
+
 ## Install the skill into your agent
 
 The agent skill (syntax cheat-sheet + 8 workflow templates + binary-install guidance) lives in [`skills/gxp/`](skills/gxp/):

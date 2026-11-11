@@ -44,3 +44,4 @@ Examples (see docs/gxp-design-full.md §2.4 for full syntax):
   gxp 'ERROR | count' app.log                                               # ≡ grep -c ERROR app.log
   gxp 'panic | trace rust' app.log                                          # multi-line stack trace (scene A)
   gxp 'ast(rs, "$OBJ.unwrap()")' src/                                       # AST structural search (scene C)
+  gxp --query-file query.gxp app.log                                        # query from file (PowerShell 引号免穿透, scene I)

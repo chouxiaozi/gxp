@@ -47,8 +47,10 @@ gxp '"timeout" && cost_ms>800 | rank top 20 by cost_ms desc | fields _ts,_tag,co
 gxp 'ast(rs, "fn $NAME($ARGS) { $BODY }")' src/
 
 # 通用 flag
-gxp '<query>' <file_or_dir> [--verify] [--json] [--explain] [--strict] [--glob PATTERN] [--no-gitignore]
+gxp '<query>' <file_or_dir> [--verify] [--json] [--explain] [--strict] [--glob PATTERN] [--no-gitignore] [--query-file PATH]
 ```
+
+**Windows PowerShell 引号（高危坑）**：查询含内层双引号时，pwsh 7.3+ 用单引号包裹即可；**PS 5.1 会吃掉内层双引号**（查询静默退化为字面量搜索：0 命中、exit 0、无警告）；`\"` 转义在 pwsh 7+/bash 会泄漏反斜杠。可靠写法按优先级：① Bash 等单层引号 shell；② `cmd /c 'gxp "QUERY \"...\"" FILE'`；③ 查询写入文件后 `gxp --query-file QUERY_FILE FILE`（免引号通道，Write 工具落盘即用）。自检：挂 `--explain`，应显示 `L2 字段谓词`（如 `level in [ERROR]`）而非 `L1 必选组` 字面量。完整实测矩阵见 `references/gxp-syntax.md`「Windows PowerShell 引号」。
 
 **安装**：gxp 二进制装到 PATH 中（引导流程见 `references/gxp-install.md`），shell 直接调用 `gxp` 即可，无需 wrapper。
 
@@ -67,7 +69,7 @@ cat a.log b.log | gxp 'ERROR' -  # stdin 合并多文件
 
 详见 `references/gxp-syntax.md`（BARE + DSL 谓词 + 14 个管道动词 + CLI flag + JSON 输出）。
 
-**谓词先行**：纯 stage 查询（只写管道动词，如 `distinct by F`、`count` 单独出现）会被 BARE 模式当 ERE 字面量搜文件（0 命中、退出码 1）——查询必须以谓词开头：`trace_id exists | distinct by trace_id`、`"ERROR" | count`。
+**谓词先行**：纯 stage 查询（只写管道动词，如 `distinct by F`、`count` 单独出现）会被 BARE 模式当 ERE 字面量搜文件（0 命中、**退出码 0 无区分信号**——意外 0 命中时用 `--explain` 自检谓词落点）——查询必须以谓词开头：`trace_id exists | distinct by trace_id`、`"ERROR" | count`。
 
 **管道动词清单**（v0.48 全量）：`where` / `context N` / `count [by FIELD]` / `group by FIELD` / `rank top K by FIELD [desc|asc]` / `sort [by FIELD] [desc|asc]` / `distinct [by FIELD]` / `head N` / `sample N | sample P%` / `fields F1,F2,...` / `files [--invert]` / `stats FIELD` / `percentiles FIELD [p50,p95,p99]` / `trace [LANG]`
 

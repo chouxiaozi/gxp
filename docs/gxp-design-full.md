@@ -87,6 +87,7 @@ LLM Agent 用 grep 检索文本/日志/代码时面临三个痛点：
 - 出现 gxp 专属参数（`--explain`/`--verify`/`--strict`/`--json`）或表达式含 `&&`/`||`/`!`/`>`/`</`/`>=`/`<=`/`==`/`!=`/`[`/`]`/`|`（管道）→ gxp 模式
 - 否则 → BARE 模式（ERE 兼容）
 - 出现 grep 短选项参数（`-A`/`-B`/`-C`/`-e` 等）→ 报错并给出 gxp 等价语法提示
+- `--query-file PATH`（v0.50）：查询文本从文件读取（UTF-8、剥 BOM、trim；**单查询单行**契约，空文件/多行 fail-loud），读出后作为 `positional[0]` 参与上述全部判定——模式判定与执行语义零变化；与位置参数 pattern 互斥（同给即报错）。动机：shell 引号不可靠环境的单参数安全传递（场景 §0.2-I）——引号被 shell 剥离/污染后的查询与合法 ERE 字面量逐字节相同，产品侧不可检测（Windows PowerShell 5.1 吃内层双引号；`\"` 转义在 pwsh 7+/bash 泄漏反斜杠）
 
 **位置参数判定**（接入目录参数后适用，详见 Rust 方案 §11.5）：
 - `positional[1]` 是文件路径 → 单文件模式
@@ -351,6 +352,11 @@ gxp: 不接受选项 -A（上下文行）
 
 【或直接用 grep】
   grep -A 3 ERROR app.log
+
+# 12. --query-file：shell 引号不可靠环境的免引号通道（v0.50，场景 §0.2-I）
+$ gxp --query-file query.gxp app.log
+# query.gxp 内容（单查询单行）：level="ERROR" | count
+# 文件内查询原样进入解析器，不经过任何 shell 引号层；--query-file 与位置参数 pattern 互斥（fail-loud）
 ```
 
 ---
@@ -423,6 +429,12 @@ STRING RHS 是单一 STRING 记号，允许含空格/逗号/`]` 的值（不受 
 - `[tag]` 方括号标签
 - `"k": v` JSON 风格
 - ISO 8601 时间戳
+
+**带引号值（v0.50 契约修订，对抗评审记录见 changelog v0.50）**：
+- logfmt 值以 `"` 包裹（`level="ERROR"`）：值为引号内字节，值终点为闭合 `"`（值内空格 / `=` / `:` 不再切分字段）；`k=""` 沿用「空值 = 字段不存在」
+- 未闭合引号（`level="ERROR`）：回退空白切分并保留引号字面（fail-soft，与 v0.49 行为一致）
+- 与 JSON 通路对齐：logfmt `level="ERROR"` 与 JSON line `"level":"ERROR"` 提取值同为 `ERROR`，string equality 跨格式语义一致
+- 数值谓词同受影响：`cost_ms="900"` 剥引号后按 900 比较（v0.49 及之前视为非数值不命中，属可观测行为变化）
 
 **数值字段格式契约（v1）**：
 

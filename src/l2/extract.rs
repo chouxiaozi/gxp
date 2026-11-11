@@ -141,11 +141,9 @@ impl<'a> ExtractedFields<'a> {
                 && key.iter().all(|&c| c.is_ascii_alphanumeric() || c == b'_')
                 && key == name
             {
-                // 命中目标字段
-                let val_start = sep_pos + 1;
-                let val_end =
-                    memchr2(b' ', b'\t', &line[val_start..]).map_or(line.len(), |i| val_start + i);
-                let value = &line[val_start..val_end];
+                // 命中目标字段：值切分与 extract_logfmt_kv 共用
+                // [`logfmt_value_span`]（v0.50，§6.5.3 构造性同构）
+                let (value, _) = logfmt_value_span(line, sep_pos + 1);
                 if !value.is_empty() {
                     return Some(value);
                 }
@@ -375,6 +373,28 @@ fn extract_first_bracket_tag(line: &[u8]) -> Option<&[u8]> {
     None
 }
 
+/// logfmt 值切分（v0.50 带引号值契约，设计文档 §3.3）。
+///
+/// 返回 `(值字节切片, 扫描续点)`。规则：
+/// - 值以 `"` 起始 → 值为**引号内字节**，终点为闭合 `"`（值内空格 / `=` / `:`
+///   不切分字段），续点 = 闭合引号后一位
+/// - 未闭合引号 → 回退空白切分并保留引号字面（fail-soft，与 v0.49 行为一致）
+/// - 普通值 → 空白切分（v0.49 行为不变）
+///
+/// [`extract_logfmt_kv`] 与 [`ExtractedFields::find_value`] **共用此函数**——
+/// §6.5.3 同构镜像由单一实现构造性保证，杜绝 v0.44 B6-B9 家族的两通路语义分叉。
+fn logfmt_value_span(line: &[u8], val_start: usize) -> (&[u8], usize) {
+    if line.get(val_start) == Some(&b'"') {
+        if let Some(off) = memchr(b'"', &line[val_start + 1..]) {
+            let close = val_start + 1 + off;
+            return (&line[val_start + 1..close], close + 1);
+        }
+    }
+    // 普通值 / 未闭合引号回退：空白切分
+    let val_end = memchr2(b' ', b'\t', &line[val_start..]).map_or(line.len(), |i| val_start + i);
+    (&line[val_start..val_end], val_end + 1)
+}
+
 /// 抽取 logfmt 风格的 kv 对：`k=v` / `k:v`，空白分隔。
 ///
 /// 用 `memchr2` 扫描 `=` 和 `:`，对每个分隔符：
@@ -407,21 +427,16 @@ fn extract_logfmt_kv<'a>(line: &'a [u8], out: &mut Vec<(&'a [u8], &'a [u8])>) {
             continue;
         }
 
-        // 向右找 value 终点
-        let val_start = sep_pos + 1;
-        let val_end =
-            memchr2(b' ', b'\t', &line[val_start..]).map_or(line.len(), |i| val_start + i);
-        let value = &line[val_start..val_end];
+        // 值切分走共享 [`logfmt_value_span`]（v0.50 带引号值契约，设计文档 §3.3）
+        let (value, next) = logfmt_value_span(line, sep_pos + 1);
 
-        // 值不能为空（设计文档 §3.3 "空值"维度：空值视为字段不存在）
+        // 值不能为空（设计文档 §3.3 "空值"维度：空值视为字段不存在；
+        // `k=""` 剥引号后为空 → 同样视为字段不存在）
         if !value.is_empty() {
             out.push((key, value));
         }
 
-        start = val_end + 1;
-        if val_end >= line.len() {
-            break;
-        }
+        start = next;
     }
 }
 
@@ -552,6 +567,86 @@ mod tests {
         // 但 `path=/api/v1/users` 后 `:` 没出现，状态机扫到 `=` 后找空白
         // `404-not-found` 中没有 `:` 或 `=`,状态机取整个 `404-not-found`
         assert_eq!(f.get(b"status"), Some(&b"404-not-found"[..]));
+    }
+
+    // --- logfmt 带引号值（v0.50，设计文档 §3.3 带引号值契约）---
+
+    #[test]
+    fn test_extract_logfmt_quoted_value_stripped() {
+        // `level="ERROR"` → 值为引号内字节（与 JSON 通路对齐）
+        let line = b"level=\"ERROR\" cost_ms=1";
+        let f = ExtractedFields::extract(line);
+        assert_eq!(f.get(b"level"), Some(&b"ERROR"[..]));
+        assert_eq!(f.get(b"cost_ms"), Some(&b"1"[..]));
+    }
+
+    #[test]
+    fn test_extract_logfmt_quoted_value_with_space() {
+        // 值内空格不切分字段；后续字段正常链式提取
+        let line = b"msg=\"hello world\" k=1";
+        let f = ExtractedFields::extract(line);
+        assert_eq!(f.get(b"msg"), Some(&b"hello world"[..]));
+        assert_eq!(f.get(b"k"), Some(&b"1"[..]));
+    }
+
+    #[test]
+    fn test_extract_logfmt_quoted_value_with_eq_and_colon() {
+        // 值内 `=` / `:` 不当分隔符（闭合引号前的字节都是值）
+        let line = b"expr=\"a=b: c\" k=2";
+        let f = ExtractedFields::extract(line);
+        assert_eq!(f.get(b"expr"), Some(&b"a=b: c"[..]));
+        assert_eq!(f.get(b"k"), Some(&b"2"[..]));
+    }
+
+    #[test]
+    fn test_extract_logfmt_quoted_empty_value_skipped() {
+        // `k=""` 剥引号后为空 → 空值=字段不存在（§3.3 空值维度）
+        let line = b"k=\"\" user=alice";
+        let f = ExtractedFields::extract(line);
+        assert_eq!(f.get(b"k"), None);
+        assert_eq!(f.get(b"user"), Some(&b"alice"[..]));
+    }
+
+    #[test]
+    fn test_extract_logfmt_unclosed_quote_fallback() {
+        // 未闭合引号回退空白切分、保留引号字面（fail-soft，与 v0.49 一致）
+        let line = b"k=\"abc x=1";
+        let f = ExtractedFields::extract(line);
+        assert_eq!(f.get(b"k"), Some(&b"\"abc"[..]));
+        assert_eq!(f.get(b"x"), Some(&b"1"[..]));
+    }
+
+    #[test]
+    fn test_extract_logfmt_quoted_colon_form() {
+        // `k:v` 分隔符 + 引号值：同一 [`logfmt_value_span`] 规则
+        let line = b"level:\"ERROR\" k=1";
+        let f = ExtractedFields::extract(line);
+        assert_eq!(f.get(b"level"), Some(&b"ERROR"[..]));
+        assert_eq!(f.get(b"k"), Some(&b"1"[..]));
+    }
+
+    #[test]
+    fn test_find_value_quoted_mirror_full_extract() {
+        // find_value 快速路径与全字段 extract 结果一致（§6.5.3 镜像对账）
+        let line = b"level=\"ERROR\" msg=\"hello world\" k=\"\"";
+        assert_eq!(
+            ExtractedFields::find_value(line, b"level"),
+            Some(&b"ERROR"[..])
+        );
+        assert_eq!(
+            ExtractedFields::find_value(line, b"msg"),
+            Some(&b"hello world"[..])
+        );
+        // `k=""` 剥引号后为空 → None（find_value 空值同样跳过）
+        assert_eq!(ExtractedFields::find_value(line, b"k"), None);
+    }
+
+    #[test]
+    fn test_find_value_quoted_unclosed_mirror() {
+        // 未闭合引号：find_value 与 extract_logfmt_kv 同样回退
+        let line = b"k=\"abc x=1";
+        assert_eq!(ExtractedFields::find_value(line, b"k"), Some(&b"\"abc"[..]));
+        assert_eq!(ExtractedFields::find_value(line, b"x"), Some(&b"1"[..]));
     }
 
     // --- JSON line ---

@@ -280,13 +280,73 @@ pub(crate) fn has_any_ast_nofeature(expr: &Expr) -> bool {
 }
 
 /// DRY helper: BARE mode --explain/--verify rejection.
-fn reject_bare_explain_verify() -> crate::GxpError {
-    crate::GxpError::Runtime {
-        detail: "--explain/--verify 仅在 gxp 模式可用；当前 pattern 是 BARE 模式（ERE 兼容，无优化层）\n\
+///
+/// v0.50：pattern 形如 `level=ERROR`（单 token、无引号、含 `=`）时附加引号丢失
+/// 自检提示——该形态是 shell 剥掉 `level="ERROR"` 内层双引号后的典型残留
+/// （实测矩阵见 changelog v0.50：PS 5.1 吃内层双引号 / `\"` 转义反斜杠泄漏）。
+fn reject_bare_explain_verify(pattern: &str) -> crate::GxpError {
+    let mut detail = "--explain/--verify 仅在 gxp 模式可用；当前 pattern 是 BARE 模式（ERE 兼容，无优化层）\n\
                  触发 gxp 模式：在 pattern 中加 `|` 管道 / `&&`/`||`/`!` 操作符 / 字段谓词（如 cost_ms>800）\n\
                  示例：gxp 'ERROR | count' file   |   gxp 'cost_ms>800' file   |   参见 gxp --help"
-            .to_string(),
+        .to_string();
+    if looks_quote_stripped_eq(pattern) {
+        detail.push_str(&format!(
+            "\n引号自检：'{pattern}' 落入 BARE 字面量。若意图是字符串等值谓词，shell 可能剥掉了内层双引号——正确形态：{}",
+            quote_eq_fix(pattern)
+        ));
     }
+    crate::GxpError::Runtime { detail }
+}
+
+/// `level=ERROR` 引号丢失形态检测：单 token（无空白）、含 `=`、无 `"`。
+///
+/// 数值 RHS（`cost_ms=800`）不会到达此检测（`has_field_predicate` 前瞻已判
+/// gxp 模式）；`a=b` 形态在 BARE 是合法 ERE 字面量——提示是 advisory，
+/// 不改变判定（设计文档 §2.2：`=` 不在 BARE 谓词分歧操作符列表）。
+fn looks_quote_stripped_eq(pattern: &str) -> bool {
+    !pattern.contains('"') && !pattern.chars().any(char::is_whitespace) && pattern.contains('=')
+}
+
+/// 生成修复建议：`level=ERROR` → `level="ERROR"`（首个 `=` 处拆分）。
+///
+/// [`crate::plan`] 的 bare 字面量自检提示复用此函数（§6.5.3：同一形态
+/// 两处出现，共享实现防漂移）。
+pub(crate) fn quote_eq_fix(bare: &str) -> String {
+    match bare.find('=') {
+        Some(i) => format!("{}=\"{}\"", &bare[..i], &bare[i + 1..]),
+        None => bare.to_string(),
+    }
+}
+
+/// 多文件参数错误的 shell 碎裂启发式（v0.50）。
+///
+/// 触发：pattern 以 `ast(`/`capture(` 开头，或任一多余参数含 `"` / `&&` /
+/// `||` / 恰为独立 stage 动词——正常的多文件**路径**参数不会长这样；被 shell
+/// 剥掉引号的查询碎片会（实测：`ast(rs, "fn $F()")` 在 PS 5.1 碎成
+/// `ast(rs, fn` / `$F()")` → 多文件错）。误报仅影响错误文案（advisory）。
+fn looks_shell_split(pattern: &str, extras: &[&str]) -> bool {
+    const STAGE_VERBS: &[&str] = &[
+        "count",
+        "files",
+        "head",
+        "context",
+        "rank",
+        "sort",
+        "distinct",
+        "sample",
+        "stats",
+        "percentiles",
+        "fields",
+        "where",
+        "group",
+        "trace",
+    ];
+    let p = pattern.trim_start_matches('\'');
+    p.starts_with("ast(")
+        || p.starts_with("capture(")
+        || extras.iter().any(|e| {
+            e.contains('"') || e.contains("&&") || e.contains("||") || STAGE_VERBS.contains(e)
+        })
 }
 
 /// L2 求值所需上下文（DRY：统一封装，消除 3 处 cfg 分支复制）。
@@ -686,21 +746,27 @@ pub fn run_with_writer<W: std::io::Write>(
     // positional[1] 是数据丢失 bug，违反"诚实 > 承诺"。
     //
     // fail-loud 而非静默兜底：让用户明确知道行为，引导到已支持的等价路径。
+    // v0.50：碎片形态疑似 shell 剥引号时附加根因提示（`looks_shell_split`）。
     if positional.len() > 2 {
         let extra: Vec<&str> = positional[2..].to_vec();
-        return Err(crate::GxpError::Runtime {
-            detail: format!(
-                "多文件参数暂不支持（收到 {} 个文件参数，多余被忽略：[{}])\n\
-                 gxp 当前模型：单文件 / 目录递归 / stdin\n\
-                 多文件扫描请用以下等价路径：\n\
-                 - 目录递归：gxp '{pattern}' <dir>/\n\
-                 - glob 过滤：gxp '{pattern}' <dir>/ --glob '*.log'\n\
-                 - stdin 管道：cat f1 f2 | gxp '{pattern}' -\n\
-                 参见 gxp --help",
-                extra.len(),
-                extra.join(", "),
-            ),
-        });
+        let mut detail = format!(
+            "多文件参数暂不支持（收到 {} 个文件参数，多余被忽略：[{}])\n\
+             gxp 当前模型：单文件 / 目录递归 / stdin\n\
+             多文件扫描请用以下等价路径：\n\
+             - 目录递归：gxp '{pattern}' <dir>/\n\
+             - glob 过滤：gxp '{pattern}' <dir>/ --glob '*.log'\n\
+             - stdin 管道：cat f1 f2 | gxp '{pattern}' -\n\
+             参见 gxp --help",
+            extra.len(),
+            extra.join(", "),
+        );
+        if looks_shell_split(pattern, &extra) {
+            detail.push_str(
+                "\n提示：查询疑似被 shell 剥掉引号后按空格碎裂（PowerShell 5.1 吃内层双引号；--% 在 pwsh 7+ 脚本内碎裂/ParseError，实测见 changelog v0.50）。\n\
+                 出路：① Bash 等单层引号 shell 直接调用；② cmd /c 包装：cmd /c 'gxp \"QUERY\" FILE'（QUERY 内层双引号写作 \\\"）；③ 查询写入文件：gxp --query-file QUERY_FILE FILE",
+            );
+        }
+        return Err(crate::GxpError::Runtime { detail });
     }
 
     let file_path = positional[1];
@@ -726,7 +792,7 @@ pub fn run_with_writer<W: std::io::Write>(
         // 目录模式：--explain/--verify 在 BARE 模式下仍不适用
         if !is_gxp_mode(pattern) {
             if opts.explain || opts.verify {
-                return Err(reject_bare_explain_verify());
+                return Err(reject_bare_explain_verify(pattern));
             }
             return run_bare_mode_directory(pattern, path, opts, out);
         }
@@ -737,7 +803,7 @@ pub fn run_with_writer<W: std::io::Write>(
             run_gxp_mode(pattern, file_path, opts, out)
         } else {
             if opts.explain || opts.verify {
-                return Err(reject_bare_explain_verify());
+                return Err(reject_bare_explain_verify(pattern));
             }
             run_bare_mode(pattern, file_path, &opts, out)
         }
@@ -803,7 +869,7 @@ pub fn dispatch_with_content<W: std::io::Write>(
         run_gxp_mode_with_content(pattern, file_path, opts, content, out)
     } else {
         if opts.explain || opts.verify {
-            return Err(reject_bare_explain_verify());
+            return Err(reject_bare_explain_verify(pattern));
         }
         run_bare_mode_with_content(pattern, file_path, content, &opts, out)
     }
@@ -863,6 +929,55 @@ mod tests {
         // 无操作符邻接的引号（字面量并列 / ast 模式）
         assert!(!has_quoted_wrong_op(r#""a" && "b""#));
         assert!(!has_quoted_wrong_op(r#"ast(ts, "useQuery($A)")"#));
+    }
+
+    // --- v0.50 引号丢失启发式 ---
+
+    #[test]
+    fn test_looks_quote_stripped_eq_shapes() {
+        // 引号丢失典型残留
+        assert!(looks_quote_stripped_eq("level=ERROR"));
+        assert!(looks_quote_stripped_eq("user=admin"));
+        // 带引号（完好形态）/ 含空白（多 token）/ 不含 = → 不触发
+        assert!(!looks_quote_stripped_eq(r#"level="ERROR""#));
+        assert!(!looks_quote_stripped_eq("level=ERROR | count"));
+        assert!(!looks_quote_stripped_eq("ERROR"));
+    }
+
+    #[test]
+    fn test_quote_eq_fix_forms() {
+        assert_eq!(quote_eq_fix("level=ERROR"), r#"level="ERROR""#);
+        // 多个 = 只按首个拆分（RHS 原样保留）
+        assert_eq!(quote_eq_fix("a=b=c"), r#"a="b=c""#);
+        // 无 = 原样返回（防御分支）
+        assert_eq!(quote_eq_fix("plain"), "plain");
+    }
+
+    #[test]
+    fn test_looks_shell_split_shapes() {
+        // ast( 碎裂形态：pattern 残留 ast( 前缀
+        assert!(looks_shell_split("ast(rs,", &["fn", "$F()\""]));
+        // 碎片含引号 / && / 独立动词
+        assert!(looks_shell_split("level=", &["\"ERROR\"", "app.log"]));
+        assert!(looks_shell_split("pat", &["&&", "x.log", "y.log"]));
+        assert!(looks_shell_split("pat", &["count", "app.log"]));
+        // 正常多文件路径参数：不触发
+        assert!(!looks_shell_split("ERROR", &["a.log", "b.log"]));
+        assert!(!looks_shell_split("ERROR", &["src/", "docs/"]));
+    }
+
+    #[test]
+    fn test_reject_bare_explain_verify_hint() {
+        // `level=ERROR` + explain → 附加引号自检与修复形态
+        let e = reject_bare_explain_verify("level=ERROR");
+        let msg = format!("{e}");
+        assert!(msg.contains("仅在 gxp 模式可用"), "得到: {msg}");
+        assert!(msg.contains("引号自检"), "得到: {msg}");
+        assert!(msg.contains("level=\"ERROR\""), "得到: {msg}");
+        // 普通无 = 形态：无自检行
+        let e2 = reject_bare_explain_verify("ERROR timeout");
+        let msg2 = format!("{e2}");
+        assert!(!msg2.contains("引号自检"), "得到: {msg2}");
     }
 
     #[test]

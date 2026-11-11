@@ -50,8 +50,9 @@ gxp 面向 LLM agent。特性取舍判据：场景驱动 + 输出自包含 + 不
 | F | 抽样审计 | 大结果集代表性采样（context window 物理限制） | `pattern \| sample N`；`pattern \| sample P%` |
 | G | 去重列表 | 唯一错误/唯一用户/唯一 trace | `pattern \| distinct`；`pattern \| distinct by FIELD` |
 | H | 全量排序 | 全量有序输出（rank 之外） | `pattern \| sort by FIELD [desc\|asc]` |
+| I | 调用可靠性 | shell 引号不可靠环境（Windows PowerShell 5.1/pwsh 7+ 正确习惯互斥）下单参数查询安全传递 | `--query-file PATH`（v0.50；引号丢失后与合法字面量逐字节相同、产品侧不可检测，实测矩阵见 changelog v0.50） |
 
-**判据用法**：新特性提案须指出对应场景（A-H），不在清单内 → 先补清单再评估。等价组合替代优先（§0.1 第 3 条）；新动词仅在组合无法覆盖或语法负担过重时落地。场景清单不是动词清单——动词清单见 `docs/capability-matrix.md` §1。
+**判据用法**：新特性提案须指出对应场景（A-I），不在清单内 → 先补清单再评估。等价组合替代优先（§0.1 第 3 条）；新动词仅在组合无法覆盖或语法负担过重时落地。场景清单不是动词清单——动词清单见 `docs/capability-matrix.md` §1。
 
 ### 当前仓库状态
 
@@ -113,6 +114,7 @@ gxp/
 | `count` 管道动词（等价 -c） | §2.4 示例 9 | `ERROR app.log \| count` |
 | 字面 `>` 的表达 | §2.4 示例 10 | `"cost>800"` / `/cost>800/` / `cost\>800` |
 | grep 短选项的四段式报错 | §2.4 示例 11 | `gxp -A 3 'ERROR' app.log` → 四段式错误 |
+| `--query-file` 免引号通道 | §2.4 示例 12 | `gxp --query-file query.gxp app.log`（场景 §0.2-I） |
 
 ---
 
@@ -134,7 +136,7 @@ gxp/
 
 ### 3.2 文档增长约束
 
-- **AGENTS.md ≤ 340 行**：版本历史移至 `docs/changelog.md`（不在本文件保留版本行）。行数上限 2026-11-01 从 320 放到 330、2026-11-09 从 330 放到 340，理由：§6.5.2-6.5.3 自举组合+同构镜像检查项随 bug 修复积累，是防回归机制核心约束不可下沉
+- **AGENTS.md ≤ 345 行**：版本历史移至 `docs/changelog.md`（不在本文件保留版本行）。行数上限 2026-11-01 从 320 放到 330、2026-11-09 从 330 放到 340（理由：§6.5.2-6.5.3 自举组合+同构镜像检查项随 bug 修复积累，是防回归机制核心约束不可下沉）、2026-11-11 从 340 放到 345（理由：§0.2 场景行 I 调用可靠性场景随 `--query-file` 落地，是特性取舍判据链必需，不宜压缩既有场景描述）
 - **Rust 方案 ≤ 1500 行**：版本历史引用 `docs/changelog.md`，不重复
 
 ## 4. 代码规范
@@ -223,7 +225,7 @@ gxp/
 > gxp 是本项目的产物，也是工作工具。改代码前搜索、改代码后验证、重构后对账三个阶段都必须自举。
 > **强制约束**：任何 Edit/Write 后立即跑对应自举查询，违反等同不变式违反（按 §5.3 立即修复，不留过夜）。LLM 默认用 Grep 工具而非 gxp 自举——这是已重犯 2 次的偏移（memory `feedback_self_bootstrap_search_phase_violation_repeated.md`），规则文档无法根治偏移，但强制约束让违反显式化、可追溯。
 
-**搜索阶段（写代码前）**：分析源码结构、查找重复逻辑时优先用 gxp 而非 Grep/Explore agent。找结构重复用 `ast(rs, "if $C { $A } else { $B }")' src/`（Grep 找不到结构）；找字面量/函数调用用 BARE 模式（自举验证自身正确性）。
+**搜索阶段（写代码前）**：分析源码结构、查找重复逻辑时优先用 gxp 而非 Grep/Explore agent。找结构重复用 `ast(rs, "if $C { $A } else { $B }")' src/`（Grep 找不到结构）；找字面量/函数调用用 BARE 模式（自举验证自身正确性）。**Windows 上含内层双引号的查询一律走 Bash 工具**（pwsh 5.1 吃内层引号、`\"` 转义反斜杠泄漏，实测矩阵见 changelog v0.50）；无 Bash 环境用 `--query-file`。
 
 **搜索结果可信度判断**：BARE 模式结果必须与 `grep -E` 一致（不一致即 bug）；ast() 查询结果必须 `--verify` 0 FAIL 才可信。
 
